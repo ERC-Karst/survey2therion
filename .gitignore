@@ -1,0 +1,14 @@
+converted/*
+# sample_data/Vallorbe_05.Text
+sample_data/*
+therion_export/*
+
+*.3d
+*.sql
+*.dbf
+*.shp
+*.shx
+*/outputs/*
+*/__pycache__/*
+*.log
+*.pyc
