@@ -348,10 +348,6 @@ class Centreline:
         # now check whether the date has been given at all.
             self.declinations = {0: input_str.split(" ")[4]}
 
-    def add_declination(self, declination, declination_index):
-        self.declinations[declination_index] = declination  
-  
-
 
     def add_string_repr(self) -> None:
         
