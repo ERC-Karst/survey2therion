@@ -7,9 +7,9 @@ This provides a parser for converting VisualTopo file structures to therion
 """
 
 import argparse
-from os.path import abspath, dirname, split, isdir, join
+from os.path import abspath, dirname, split, join
 
-import subprocess
+from os import makedirs
 
 # the behaviour of the class is sort of tested
 from helpers.utils import * 
@@ -70,7 +70,7 @@ def find_entrance_fix(data: list[str], format : str, crs: str) -> Fix:
                 x, y, z = float(split_l[1]), float(split_l[3]), float(split_l[5])
 
             if '<Entree>' in l:
-                entrance_name = l.strip(" ").strip("\t").strip("<Entree>").split("<")[0]
+                entrance_name = l.strip().removeprefix("<Entree>").split("<")[0]
                 print("entrance name: ", entrance_name)
             elif '<Entree ' in l:
                 # for newer trox versions. 
@@ -307,10 +307,9 @@ def parse_LRUDS(lines: list[str], format : str) -> list[LineLRUD]:
         else:
             print("skipping empty line {}".format(c))
             print(line)
-        try:
-            lrud_lines.append(LRUDline) # type:ignore
-        except:
-            print("skipped a line here.")
+            continue
+
+        lrud_lines.append(LRUDline)
 
     return lrud_lines
 
@@ -349,14 +348,19 @@ def parse_normal_data(lines: list[str], format: str ) -> list[NormalDataLine]:
     equateLines = []
 
 
+    previous_to_station = None
+
     for c,line in enumerate(datalines):
         print(line)
-        if "*" in line[0] and len(line) >=5:
-            if "Commentaire" not in " ".join(line):
-                dataLine = NormalDataLine(datalines[c-1][1],line[1],float(line[2]),float(line[3]),float(line[4]))
+        continues_previous_shot = len(line) > 0 and "*" in line[0]
+        if continues_previous_shot and "Commentaire" in " ".join(line):
+            print("skipping comment line {}".format(c))
+
         elif len(line) >=5:
-            
-            dataLine = NormalDataLine(line[0],line[1],float(line[2]),float(line[3]),float(line[4]))
+            # a * from station means the shot starts where the previous shot ended
+            from_station = previous_to_station if continues_previous_shot else line[0]
+            dataLine = NormalDataLine(from_station,line[1],float(line[2]),float(line[3]),float(line[4]))
+            previous_to_station = dataLine.to_station
 
             if dataLine.tape != 0:  # type:ignore
                 dataLines.append(dataLine) # type:ignore
@@ -499,17 +503,15 @@ def make_centrelines_list(data : list[str], fmt: str, expand_lrud: bool = True )
         newCentreline = Centreline(fmt=fmt)
         print(date)
         newCentreline.add_Date(date)
-        if format == "tro":
-            header = data[start-1]
+        # the first word of the header line is "Param" in tro files and the tag name in trox files, so we drop it
+        if "Comment" in data[start-1]:
+            header = ""
+            for elem in data[start-2].split(" ")[1:]:
+                header += elem.split("=")[-1].strip('"')+" "
         else:
-            if "Comment" in data[start-1]:
-                header = ""
-                for elem in data[start-2].split(" ")[1:]:
-                    header += elem.split("=")[-1].strip('"')+" "
-            else:
-                header = ""
-                for elem in data[start-1].split(" ")[1:]:
-                    header += elem.split("=")[-1].strip('"')+" "
+            header = ""
+            for elem in data[start-1].split(" ")[1:]:
+                header += elem.split("=")[-1].strip('"')+" "
 
         newCentreline.parse_strategy(header)
         newCentreline.parse_units(header)
@@ -647,12 +649,7 @@ if __name__ == "__main__":
 
     # create the output directory if it does not already exist.
 
-    if not isdir(WRITE_PATH):
-        subprocess.check_output(f'md "{WRITE_PATH}"', shell=True)
-
-    if not isdir(join(WRITE_PATH, "outputs")):
-        THERION_OUTPUTS_DIR = join(WRITE_PATH, 'outputs')
-        subprocess.check_output(f'md "{THERION_OUTPUTS_DIR}"', shell=True)
+    makedirs(join(WRITE_PATH, "outputs"), exist_ok=True)
     
     with open(EXIT_FILE, 'w+', encoding="utf-8") as f:
         f.write(newSurvey._string_repr)
