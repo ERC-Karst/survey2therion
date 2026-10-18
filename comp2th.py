@@ -7,8 +7,9 @@ This provides a parser for converting "Compass" files to therion
 """
 
 import argparse
-from os.path import abspath, split, join, isdir, normpath, dirname, isfile
-import subprocess
+from os.path import abspath, split, join, normpath, dirname, isfile
+from os import makedirs, listdir
+from shutil import copy
 from helpers.therion_classes import *
 from helpers.utils import *
 from def_calc_splay_from_lrud import *
@@ -159,7 +160,7 @@ def parse_data_header( line : str) -> dict :
     Returns dictionary containing the data description
     """
     
-    declination = line.split("FORMAT:")[0].strip("DECLINATION:").strip(" ").strip("\t")
+    declination = line.split("FORMAT:")[0].strip().removeprefix("DECLINATION:").strip()
     if "FORMAT:" not in line:
         format = "DDDDLRUDLADN"
     else:
@@ -232,6 +233,13 @@ def parse_format( format: str) -> dict :
 def validate_stn_name(stn: str) -> str:
     return stn.replace("!", "exc").replace("'", "quote").replace("`", "revquote").replace("?", "q").replace("*", "ast").replace("#", "hash").replace("$", "dol").replace("%", "perc").replace("&", "amp").replace("=","eq")
 
+def format_dimension(value: str) -> str:
+    """Format a passage dimension in feet. Compass writes missing dimensions as negative values or 999, and we write them as 0"""
+    dimension = float(value)
+    if dimension < 0 or dimension == 999:
+        dimension = 0
+    return f"{dimension:.2f}"
+
 def parse_measurement( line: str) -> dict:
 
     rawparts =[elem.strip(" ") for elem in line.split("#")[0].split(" ") if elem != ""] # split the parts by spaces.
@@ -277,10 +285,10 @@ def parse_measurement( line: str) -> dict:
                    "length": parts[2],
                    "compass": parts[3],
                    "clino": parts[4],
-                   "left": f"{max(0, float(parts[5])):.2f}",
-                   "up": f"{max(0, float(parts[6])):.2f}",
-                   "down": f"{max(0, float(parts[7])):.2f}",
-                   "right": f"{max(0, float(parts[8])):.2f}",
+                   "left": format_dimension(parts[5]),
+                   "up": format_dimension(parts[6]),
+                   "down": format_dimension(parts[7]),
+                   "right": format_dimension(parts[8]),
                    "backcompass": f"{float(parts[9]):.2f}",
                    "backclino": f"{float(part10):.2f}",
                    "comment":comment_str,
@@ -318,10 +326,10 @@ def parse_measurement( line: str) -> dict:
                    "length": parts[2],
                    "compass": parts[3],
                    "clino": parts[4],
-                   "left": f"{max(0, float(parts[5])):.2f}",
-                   "up": f"{max(0, float(parts[6])):.2f}",
-                   "down": f"{max(0, float(parts[7])):.2f}",
-                   "right": f"{max(0, float(part8)):.2f}",
+                   "left": format_dimension(parts[5]),
+                   "up": format_dimension(parts[6]),
+                   "down": format_dimension(parts[7]),
+                   "right": format_dimension(part8),
                    "comment":comment_str,
                    "flag": flag,
                    }
@@ -587,10 +595,8 @@ def inject_lrud(shot_series, station_dim_series, data_format):
 
     centreline_units = Units("empty")
     centreline_units.length=data_format["units length"]
-    if len(data_format["units clino"]) == 1:
-         centreline_units.clino=data_format["units clino"][0]
-    #else:
-    #   centreline_units.clino=data_format["units clino"],
+    if data_format["units clino"] == "grads":
+        centreline_units.clino = "grads"
     centreline_units.compass=data_format["units compass"]
 
     order = data_format["header_order"]
@@ -603,7 +609,7 @@ def inject_lrud(shot_series, station_dim_series, data_format):
     station_counter = 0
     for c, lrudLine in enumerate(station_dim_series):
 
-        from_station, left, up, down, right = lrudLine.replace("999.00", "0.00").split(" ")
+        from_station, left, up, down, right = lrudLine.split(" ")
 
         th_lrudLine = LineLRUD(from_station=from_station, 
                                left= float(left), 
@@ -671,7 +677,7 @@ def inject_lrud(shot_series, station_dim_series, data_format):
 
 
                         # now we know we have found good station. 
-                        if isinstance(shot_series[k+1], NormalDataLine):
+                        if shot_series[k+1].split()[0] == lrud_station:
                             dataline2= shot_series[k+1]
                             from_station, to_station = dataline2.split()[:2]
                             compass = dataline2.split()[comp_idx]
@@ -711,8 +717,7 @@ def inject_lrud(shot_series, station_dim_series, data_format):
                             cartesian_1 = spherical2cartesian(comp1, clino1, centreline_units)
                             cartesian_2 = spherical2cartesian(comp2, clino2, centreline_units)
                 
-                            # unit bissector vector. 
-                            normal_vec = (cartesian_1 + cartesian_2) / np.linalg.norm(cartesian_1 + cartesian_2)
+                            normal_vec = bisector(cartesian_1, cartesian_2)
 
                             # splay from normal vector and lruds 
                             station_counter = k+1
@@ -798,7 +803,7 @@ def format_centreline_str(shot_series,
 
         full_stn_dim_series = ""
         for line in station_dim_series:
-            full_stn_dim_series+=line.replace("999.00", "0.00")
+            full_stn_dim_series+=line
 
         full_comments = ""
         for line in comments:
@@ -997,7 +1002,9 @@ if __name__ == "__main__":
     ENTRY_DIRECTORY = abspath(args.survey_directory)
 
     if args.index_file != "None":
-        INDEX_FILE = join(ENTRY_DIRECTORY, args.index_file)
+        # the index file sits next to the survey file, or inside the survey directory
+        INDEX_DIRECTORY = dirname(ENTRY_DIRECTORY) if isfile(ENTRY_DIRECTORY) else ENTRY_DIRECTORY
+        INDEX_FILE = join(INDEX_DIRECTORY, args.index_file)
     else:
         INDEX_FILE = "None"
 
@@ -1016,18 +1023,18 @@ if __name__ == "__main__":
     ## SET UP THE EXPORT DIRECTORIES WITH OUTPUTS AND ORIGINAL DATA SUBDIRECTORIESs
     WRITE_PATH =  abspath(OUTPUT_DIRECTORY)
     
-    if not isdir(WRITE_PATH):
-        subprocess.check_output(f'md "{join(WRITE_PATH)}"', shell=True)
-    
     OUTPUTS_FILEPATH = join(WRITE_PATH,  "outputs")
-    if not isdir(OUTPUTS_FILEPATH):
-        subprocess.check_output(f'md "{OUTPUTS_FILEPATH}"', shell=True)
+    makedirs(OUTPUTS_FILEPATH, exist_ok=True)
 
     ORIGS_FILEPATH = join(WRITE_PATH,  "original_data")
-    if not isdir(ORIGS_FILEPATH):
-        subprocess.check_output(f'md "{ORIGS_FILEPATH}"', shell=True)
+    makedirs(ORIGS_FILEPATH, exist_ok=True)
     
-    subprocess.check_output(f'copy  "{ENTRY_DIRECTORY}" "{ORIGS_FILEPATH}"\\', shell=True)
+    if isfile(ENTRY_DIRECTORY):
+        copy(ENTRY_DIRECTORY, ORIGS_FILEPATH)
+    else:
+        for entry in listdir(ENTRY_DIRECTORY):
+            if isfile(join(ENTRY_DIRECTORY, entry)):
+                copy(join(ENTRY_DIRECTORY, entry), ORIGS_FILEPATH)
 
 
     ## READING IN .
