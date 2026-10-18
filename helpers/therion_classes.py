@@ -50,17 +50,6 @@ class LineLRUD:
     azimuth : float = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.from_station == "B3":
-            print(self.left, self.right, self.up, self.down)
-        for elem in [self.left, self.right, self.up, self.down]:
-            
-            if (elem-999)**2 < 0.1:
-                print("found a 999!")
-                elem = 0.00
-            elif float(elem) == 999.0:
-                print("found a 999!")
-
-
         self.dims = [self.left, self.right, self.up, self.down]
 
 @dataclass
@@ -72,11 +61,11 @@ class Equate:
     command : str = field(init=False)
 
     def __post_init__(self) -> None:
-        if not (self.survey1 and self.survey2):
+        if not self.survey1 and not self.survey2:
             self.command = f'\n\tequate {self.stn1} {self.stn2}'
         elif not self.survey1:
             self.command = f'\n\tequate {self.stn1} {self.stn2}@{self.survey2}'
-        elif not self.survey1:
+        elif not self.survey2:
             self.command = f'\n\tequate {self.stn1}@{self.survey1} {self.stn2}'
         else:
             self.command = f'\n\tequate {self.stn1}@{self.survey1} {self.stn2}@{self.survey2}'
@@ -97,6 +86,14 @@ class LineFlag:
     
     def __post_init__(self) -> None:
         self.command = f"""\n\tflags {self.flag}"""
+
+@dataclass
+class LineDeclination:
+    declination : float
+    command : str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.command = f"\n\tdeclination {self.declination} degrees"
 
 @dataclass
 class CommentedLine:
@@ -309,12 +306,22 @@ class Centreline:
             elif len(date.split("-"))== 3:
                 DATE = date.split("-")
             elif len(date)==6:
-                DATE = [date[:2]+date[2:4]+date[4:]]
+                DATE = [date[:2], date[2:4], date[4:]]
             else:
-                DATE = ["01", "01", "2001"]
+                # we can't read this date, so the survey stays undated
+                self.add_Date(None)
+                return
+
+            DATE = [part.strip() for part in DATE]
+
+            # a 4-digit first part is the year of a YYYY.MM.DD date
+            if len(DATE[0]) == 4:
+                DATE = DATE[::-1]
 
             # dates are sometimes given in DDMMYY format.
-            if int(DATE[2]) < 50:
+            if len(DATE[2]) == 4:
+                DATE[2] = int(DATE[2])
+            elif int(DATE[2]) < 50:
                 DATE[2] = 2000+int(DATE[2])
             elif int(DATE[2]) < 100:
                 DATE[2] = 1900+int(DATE[2])
@@ -423,7 +430,7 @@ class Centreline:
 class Survey:
     name : str
     isTopLevel : bool = False
-    entrance_fix : Fix = field(init= False, default_factory= str)
+    entrance_fixes : list[Fix] = field(init= False, default_factory= list)
     centrelines : list[Centreline] = field(init= False, default_factory= list)
     inputs:  list[Input] = field(init= False, default_factory= list)
     equates:  list[Equate] = field(init= False, default_factory= list)
@@ -481,15 +488,15 @@ class Survey:
         """
         self.inputs += input
 
-    def add_entrance_fix(self, entrance_fix : str) -> None:
-        """Parse the entrance name from the survey file.
+    def add_entrance_fix(self, entrance_fix : Fix) -> None:
+        """Appends a fixed station found in the survey file. The first one is used as the survey entrance
 
         Parameters
         ----------
-        entrance : str
-            the entrance name found using a regex query.
+        entrance_fix : Fix
+            the fixed station and its coordinates.
         """
-        self.entrance_fix = entrance_fix
+        self.entrance_fixes.append(entrance_fix)
 
     def add_child(self, child) -> None:
         """Appends every centreline found in the survey file
@@ -517,13 +524,14 @@ class Survey:
 
 survey {self.name.strip('"')} """
         
-        if self.entrance_fix != "":
+        if len(self.entrance_fixes) > 0:
+            fix_commands = "\n".join(fix.command for fix in self.entrance_fixes)
 
-            self._string_repr +=f"""-entrance {self.entrance_fix.name}
+            self._string_repr +=f"""-entrance {self.entrance_fixes[0].name}
     
     # entrance fix.
     centreline
-{self.entrance_fix.command}
+{fix_commands}
     endcentreline
 
 """
@@ -550,7 +558,7 @@ survey {self.name.strip('"')} """
 {centrelines}"""
 
             
-        if self.isTopLevel and len(self.children) > 1:
+        if self.isTopLevel and len(self.children) > 0:
             for child in self.children:
                 self._string_repr += f"""
 {child._string_repr}"""

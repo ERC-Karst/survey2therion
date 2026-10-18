@@ -50,6 +50,13 @@ def spherical2cartesian(compass, clino, units):
     
     return uv
 
+def bisector(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Return the unit vector halfway between two unit vectors. Opposite vectors have no bisector, so we return the first one"""
+    total = u + v
+    if np.linalg.norm(total) < 1.e-5:
+        return u
+    return total / np.linalg.norm(total)
+
 def cartesian2spherical(u: np.ndarray, units, vert_threshold: float = 70) -> tuple:
     """Returns the angular inclination and angle from north from a vector in cartesian
     coordinates, depending on the current units of a centreline block.
@@ -228,8 +235,7 @@ def inject_lrud(centreline, lrudlines, datalines):
                                     cartesian_1 = spherical2cartesian(comp1, clino1, centreline.units)
                                     cartesian_2 = spherical2cartesian(comp2, clino2, centreline.units)
                         
-                                    # unit bissector vector. 
-                                    normal_vec = (cartesian_1 + cartesian_2) / np.linalg.norm(cartesian_1 + cartesian_2)
+                                    normal_vec = bisector(cartesian_1, cartesian_2)
 
                                     # splay from normal vector and lruds 
                                     station_counter = k+1
