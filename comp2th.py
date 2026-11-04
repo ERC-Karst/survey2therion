@@ -12,6 +12,7 @@ from os import makedirs, listdir
 from shutil import copy
 from helpers.therion_classes import *
 from helpers.utils import *
+from helpers.station_names import station_renaming
 from def_calc_splay_from_lrud import *
 
 _LINE_TYPES = {"measurement": [0,13, 26, 35, 44, 53, 62, 71, 80, 89, 97],
@@ -195,6 +196,8 @@ def parse_format( format: str) -> dict :
     dim3 = _DIMENSIONS[format[6]]
     dim4 = _DIMENSIONS[format[7]]
     shot_item_1 = _SHOT_ITEMS[format[8]] 
+    # the last character of a 13 or 15 character format tells whether the passage dimensions belong to the from or the to station. Older formats don't say, and we take the from station
+    lrud_station = "to" if len(format) in (13, 15) and format[-1] == "T" else "from"
 
     if "DdAa" in format or "AaDd" in format:
         shot_item_2 = _SHOT_ITEMS[format[9]]
@@ -210,7 +213,8 @@ def parse_format( format: str) -> dict :
                     "units backclino": inc_units,
                     "header_order": ["from","to", shot_item_1, shot_item_2, shot_item_4, shot_item_3, shot_item_5, dim1, dim2, dim3, dim4],
                     "orig_data_header": f"data normal from to {shot_item_1} {shot_item_2} {shot_item_4} {shot_item_3}  {shot_item_5}",
-                    "station_dims_header": f"data dimensions station left up down right"
+                    "station_dims_header": f"data dimensions station left up down right",
+                    "lrud station": lrud_station,
                     }
     else: 
         shot_item_2 = _SHOT_ITEMS[format[9]]
@@ -224,14 +228,12 @@ def parse_format( format: str) -> dict :
                     "units clino": inc_units,
                     "header_order": ["from","to", shot_item_1, shot_item_2, shot_item_3, dim1, dim2, dim3, dim4],
                     "orig_data_header": f"data normal from to {shot_item_1} {shot_item_2} {shot_item_3}",
-                     "station_dims_header": f"data dimensions station left up down right"
+                     "station_dims_header": f"data dimensions station left up down right",
+                     "lrud station": lrud_station,
                     }
 
     return data_format
 
-
-def validate_stn_name(stn: str) -> str:
-    return stn.replace("!", "exc").replace("'", "quote").replace("`", "revquote").replace("?", "q").replace("*", "ast").replace("#", "hash").replace("$", "dol").replace("%", "perc").replace("&", "amp").replace("=","eq")
 
 def format_dimension(value: str) -> str:
     """Format a passage dimension in feet. Compass writes missing dimensions as negative values or 999, and we write them as "-", which Therion reads as a dimension that wasn't measured"""
@@ -283,8 +285,8 @@ def parse_measurement( line: str) -> dict:
             comment_str+= elem.strip("\n").replace('"', "'")
         
 
-        measurement = {"from": validate_stn_name(parts[0]), 
-                   "to": validate_stn_name(parts[1]),
+        measurement = {"from": parts[0], 
+                   "to": parts[1],
                    "length": parts[2],
                    "compass": parts[3],
                    "clino": parts[4],
@@ -324,8 +326,8 @@ def parse_measurement( line: str) -> dict:
             comment_str+= elem.strip("\n").replace('"', "'")
         
 
-        measurement = {"from": validate_stn_name(parts[0]), 
-                   "to": validate_stn_name(parts[1]),
+        measurement = {"from": parts[0], 
+                   "to": parts[1],
                    "length": parts[2],
                    "compass": parts[3],
                    "clino": parts[4],
@@ -448,9 +450,12 @@ def format_station_dimensions(measurement: dict, data_format: dict) -> str:
             if measurement[dim] != "-":
                 measurement[dim] = ft2m(measurement[dim])
 
-    line = f"{measurement['to']} {measurement['left']} {measurement['up']} {measurement['down']} {measurement['right']}"
+    line = f"{measurement[data_format['lrud station']]} {measurement['left']} {measurement['up']} {measurement['down']} {measurement['right']}"
     line +="\n"
     return line 
+
+def has_comment(measurement: dict) -> bool:
+    return len(measurement["comment"]) > 3
 
 def format_comment(measurement: dict)-> str:
  
@@ -458,7 +463,7 @@ def format_comment(measurement: dict)-> str:
     stn_name = measurement["from"]
     flag = measurement["flag"]
 
-    if len(comment) > 3:
+    if has_comment(measurement):
               
         if "X" in flag or "P" in flag:
             comment_str = f'#station {stn_name} "{comment}"'
@@ -509,7 +514,34 @@ def find_series_start_end(data: list) -> list:
             ends.append(c-1)
     return starts, ends
 
-def list_all_measurement_series( data: list, data_formats: list) -> list:
+def parse_measurements(lines: list[str]) -> list[dict]:
+    measurements = []
+    for line in lines:
+        try: 
+            length = float(line.split()[3]) # try to parse third element.
+            measurement = parse_measurement(line)
+        except:
+            measurement = None
+        if measurement is not None:
+            measurements.append(measurement)
+    return measurements
+
+def project_renaming(datas: list[list[str]], fixes: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
+    """Rename the stations of a project with station_renaming. The files and the fixes of a project share one Therion survey, so they share the new names
+
+    Returns
+    -------
+    tuple
+        the new name of each renamed station keyed by its original name, and the original name of each renamed station without a comment of its own keyed by its new name
+    """
+    measurements = [measurement for data in datas for measurement in parse_measurements(data)]
+    renaming = station_renaming([measurement[station] for measurement in measurements for station in ("from", "to")] + [fix["name"] for fix in fixes])
+    commented = {measurement["from"] for measurement in measurements if has_comment(measurement)}
+    original_names = {new_name: original for original, new_name in renaming.items() if original not in commented}
+    return renaming, original_names
+
+def list_all_measurement_series( data: list, data_formats: list, renaming: dict[str, str], original_names: dict[str, str]) -> list:
+    """Format the shots, dimensions and comments of each trip. The original name of a renamed station goes in the comments of the first trip using it, and we remove it from original_names"""
     measurement_series = []
     dimension_series = []
     comments_series = []
@@ -522,25 +554,19 @@ def list_all_measurement_series( data: list, data_formats: list) -> list:
         formatted_measurements = []
         formatted_dimensions = []
 
-        for line in series_data:
-            try: 
-                length = float(line.split()[3]) # try to parse third element.
-                measurement = parse_measurement(line)
-            except:
-                measurement = None
-            
-            if measurement is not None:
-                
-                formatted_measurement = format_measurement(measurement, data_format)
-                formatted_measurements.append(formatted_measurement)
-                formatted_comment = format_comment(measurement)
-                formatted_dimension = format_station_dimensions(measurement, data_format)
-                formatted_dimensions.append(formatted_dimension)
-                if formatted_comment != "None":
-                    formatted_comments.append(formatted_comment)
-
-
-
+        for measurement in parse_measurements(series_data):
+            measurement["from"] = renaming.get(measurement["from"], measurement["from"])
+            measurement["to"] = renaming.get(measurement["to"], measurement["to"])
+            for station in (measurement["from"], measurement["to"]):
+                if station in original_names:
+                    formatted_comments.append(StationWithComment(station, original_names.pop(station)).command)
+            formatted_measurement = format_measurement(measurement, data_format)
+            formatted_measurements.append(formatted_measurement)
+            formatted_comment = format_comment(measurement)
+            formatted_dimension = format_station_dimensions(measurement, data_format)
+            formatted_dimensions.append(formatted_dimension)
+            if formatted_comment != "None":
+                formatted_comments.append(formatted_comment)
 
         measurement_series.append(formatted_measurements)
         comments_series.append(formatted_comments)    
@@ -837,10 +863,10 @@ endcentreline"""
 
     return session_str
 
-def format_all_centrelines(data, lrud= True):
+def format_all_centrelines(data, renaming, original_names, lrud= True):
 
     surveys, survey_titles, survey_dates, survey_teams, declinations, data_formats, corrections = list_all_surveys(data)
-    series, station_dims, comments = list_all_measurement_series(data, data_formats)
+    series, station_dims, comments = list_all_measurement_series(data, data_formats, renaming, original_names)
     centrelines = ""
 
 
@@ -886,7 +912,7 @@ def parse_surface_fixes(datafile : str) -> list:
                 unit, x, y, z = "m", 0., 0., 0.
                 pass
 
-            fix["name"] = stn_name.strip("\n").strip(",")
+            fix["name"] = stn_name.strip().strip(",")
             fix["unit"] = unit
             fix["x"] = x
             fix["y"] = y
@@ -894,7 +920,8 @@ def parse_surface_fixes(datafile : str) -> list:
             fixes.append(fix)
     return fixes
 
-def format_fix( fix: dict) -> str:
+def format_fix( fix: dict, renaming: dict[str, str]) -> str:
+    fix = {**fix, "name": renaming.get(fix["name"], fix["name"])}
     # always convert the fix to metric. 
     if fix["unit"] == "f":
         x = feet_to_metres(float(fix['x']))
@@ -915,12 +942,12 @@ def format_fix( fix: dict) -> str:
 
     return formatted_fix
 
-def format_all_fixes( fixes: list) -> str:
+def format_all_fixes( fixes: list, renaming: dict[str, str]) -> str:
     if len(fixes) > 0:
         all_fixes_str = f"centreline\n"
 
         for fix in fixes:
-            all_fixes_str += format_fix(fix)
+            all_fixes_str += format_fix(fix, renaming)
         all_fixes_str+= "endcentreline\n"
     else:
         all_fixes_str = ""
@@ -1046,7 +1073,8 @@ if __name__ == "__main__":
     ## READING IN .
     if INDEX_FILE == "None" and isfile(ENTRY_DIRECTORY):
         DATA = read_file(ENTRY_DIRECTORY, encoding= "utf-8")
-        THERION_FILE_STRING = format_standalone_therion_file(BASENAME, format_all_centrelines(DATA, LRUD),"")
+        RENAMING, ORIGINAL_NAMES = project_renaming([DATA], [])
+        THERION_FILE_STRING = format_standalone_therion_file(BASENAME, format_all_centrelines(DATA, RENAMING, ORIGINAL_NAMES, LRUD),"")
 
         if CRSOUT is not None:
             CONFIG_FILE_STRING = _TH_CONFIG_FILE_TEMPLATE_WITH_CRS.format(basename=BASENAME, crsout=CRSOUT)
@@ -1074,7 +1102,8 @@ if __name__ == "__main__":
     elif INDEX_FILE != "None" and isfile(ENTRY_DIRECTORY):
         DATA = read_file(ENTRY_DIRECTORY, encoding= "utf-8")
         FIXES = parse_surface_fixes(INDEX_FILE)
-        THERION_FILE_STRING = format_standalone_therion_file(BASENAME, format_all_centrelines(DATA, LRUD), format_all_fixes(FIXES))
+        RENAMING, ORIGINAL_NAMES = project_renaming([DATA], FIXES)
+        THERION_FILE_STRING = format_standalone_therion_file(BASENAME, format_all_centrelines(DATA, RENAMING, ORIGINAL_NAMES, LRUD), format_all_fixes(FIXES, RENAMING))
         if CRSOUT is not None:
             CONFIG_FILE_STRING = _TH_CONFIG_FILE_TEMPLATE_WITH_CRS.format(basename=BASENAME, crsout=CRSOUT)
         else:
@@ -1098,12 +1127,14 @@ if __name__ == "__main__":
     else:
         # entry files to be found from the .MAK file. 
         ENTRY_FILES = find_all_inputs(INDEX_FILE)
+        DATAS = [read_file(ENTRY_FILE, encoding= "utf-8") for ENTRY_FILE in ENTRY_FILES]
+        FIXES = parse_surface_fixes(INDEX_FILE)
+        RENAMING, ORIGINAL_NAMES = project_renaming(DATAS, FIXES)
 
-        for ENTRY_FILE in ENTRY_FILES:
+        for ENTRY_FILE, DATA in zip(ENTRY_FILES, DATAS):
             PARTNAME = split(ENTRY_FILE)[1][:-4]
             print("now reading in file: ", ENTRY_FILE )
-            DATA = read_file(ENTRY_FILE, encoding= "utf-8")
-            THERION_FILE_STRING = format_therion_file(format_all_centrelines(DATA, LRUD))
+            THERION_FILE_STRING = format_therion_file(format_all_centrelines(DATA, RENAMING, ORIGINAL_NAMES, LRUD))
 
             OUTPUT_THERION_FILEPATH = join(WRITE_PATH,  f"{PARTNAME}_convert.th")
             ## Writing to file
@@ -1114,9 +1145,7 @@ if __name__ == "__main__":
                 f.close()
 
         if INDEX_FILE != None:
-            FIXES = parse_surface_fixes(INDEX_FILE)
-
-            INDEX_FILE_STRING = format_therion_index_file(basename=BASENAME, formatted_input_commands=format_all_inputs(ENTRY_FILES), formatted_fixes= format_all_fixes(FIXES))
+            INDEX_FILE_STRING = format_therion_index_file(basename=BASENAME, formatted_input_commands=format_all_inputs(ENTRY_FILES), formatted_fixes= format_all_fixes(FIXES, RENAMING))
             INDEX_FILE_PATH =  join(WRITE_PATH,   f"{BASENAME}_convert.th")
 
             ## Writing to file the index therion file

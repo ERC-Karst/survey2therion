@@ -7,8 +7,6 @@ This provides a parser for converting VisualTopo file structures to therion
 """
 
 import argparse
-import string
-import unicodedata
 from os.path import abspath, dirname, split, join
 
 from os import makedirs
@@ -16,21 +14,10 @@ from os import makedirs
 # the behaviour of the class is sort of tested
 from helpers.utils import * 
 from helpers.therion_classes import * 
+from helpers.station_names import station_renaming, add_original_names
 
 
 ### utility functions. 
-
-# Therion accepts these characters in a station name. The second set is only accepted after the first character
-_STATION_FIRST_CHARS = set(string.ascii_letters + string.digits + "_/")
-_STATION_OTHER_CHARS = _STATION_FIRST_CHARS | set("-+*.,'")
-
-def is_valid_station_name(name: str) -> bool:
-    return name[0] in _STATION_FIRST_CHARS and all(ch in _STATION_OTHER_CHARS for ch in name[1:])
-
-def rewrite_station_name(name: str) -> str:
-    """Strip the accents from the name, then replace each character Therion rejects with an underscore"""
-    letters = "".join(ch for ch in unicodedata.normalize("NFKD", name) if unicodedata.category(ch) != "Mn")
-    return "".join(ch if ch in (_STATION_FIRST_CHARS if i == 0 else _STATION_OTHER_CHARS) else "_" for i, ch in enumerate(letters))
 
 _TRO_SHOT_STATIONS = re.compile(r"^(\s*)(\S+)(\s+)(\S+)")
 _TRO_ENTRANCE = re.compile(r"^(Entree\s)(.+)$")
@@ -42,13 +29,12 @@ def is_tro_shot(line: str) -> bool:
     return len(fields) >= 5 and re.fullmatch(r"[0-9.]+", fields[2]) is not None
 
 def rename_stations(data: list[str], fmt: str) -> tuple[list[str], dict[str, str]]:
-    """Rename the stations whose name Therion rejects. Valid names stay unchanged.
-    A rewritten name already in use gets a numbered suffix, so two stations never merge.
+    """Rename the stations whose name Therion rejects, with station_renaming
 
     Returns
     -------
     tuple
-        the data with the new names, and the original name of each renamed station keyed by its new name
+        the data with the new names, and the new name of each renamed station keyed by its original name
     """
     if fmt == "tro":
         patterns = [(_TRO_ENTRANCE, [2])]
@@ -63,21 +49,9 @@ def rename_stations(data: list[str], fmt: str) -> tuple[list[str], dict[str, str
         return patterns
 
     # a tro shot starting with * continues from the station where the previous shot ended
-    names = list(dict.fromkeys(match[group] for line in data for pattern, groups in patterns_of(line)
-                               for match in pattern.finditer(line) for group in groups if match[group] not in ("*", "")))
-    taken = {name for name in names if is_valid_station_name(name)}
-    new_names, renamed = {}, {}
-    for name in names:
-        if name in taken:
-            continue
-        new_name = rewrite_station_name(name)
-        suffix = 2
-        while new_name in taken:
-            new_name = f"{rewrite_station_name(name)}_{suffix}"
-            suffix += 1
-        taken.add(new_name)
-        new_names[name] = new_name
-        renamed[new_name] = name
+    names = [match[group] for line in data for pattern, groups in patterns_of(line)
+             for match in pattern.finditer(line) for group in groups if match[group] != "*"]
+    new_names = station_renaming(names)
 
     def replace(match, groups):
         # replace the station groups from the last one, so the positions of the earlier groups stay right
@@ -92,21 +66,7 @@ def rename_stations(data: list[str], fmt: str) -> tuple[list[str], dict[str, str
         for pattern, groups in patterns_of(line):
             line = pattern.sub(lambda match: replace(match, groups), line)
         renamed_data.append(line)
-    return renamed_data, renamed
-
-def add_original_names(centrelines: list[Centreline], renamed: dict[str, str]) -> None:
-    """Keep the original name of each renamed station as its comment, unless the station has a comment of its own.
-    The comment goes in the first centreline using the station"""
-    commented = {station.name for centreline in centrelines for station in centreline.commented_stations}
-    for new_name, original in renamed.items():
-        if new_name in commented:
-            continue
-        for centreline in centrelines:
-            stations = {line.from_station for line in centreline.data} | {line.to_station for line in centreline.data} \
-                | {equate.stn1 for equate in centreline.equates} | {equate.stn2 for equate in centreline.equates}
-            if new_name in stations:
-                centreline.add_station_line(StationWithComment(new_name, original))
-                break
+    return renamed_data, new_names
 
 def read_survey_file(path: str) -> list[str]:
     """Read the lines of a VisualTopo file. VisualTopo writes latin-1, but a file saved again by another program is often UTF-8"""
@@ -567,7 +527,7 @@ def parse_diving_data(lines: list[str], format: str, station_depth_lookup: dict)
     return dataLines, equateLines
 
 
-def make_centrelines_list(data : list[str], fmt: str, renamed: dict[str, str], expand_lrud: bool = True ) -> list[Centreline]:
+def make_centrelines_list(data : list[str], fmt: str, renaming: dict[str, str], expand_lrud: bool = True ) -> list[Centreline]:
     """The main parser function: 
     -reads the original data file, 
     -finds the different centreline blocks
@@ -646,7 +606,7 @@ def make_centrelines_list(data : list[str], fmt: str, renamed: dict[str, str], e
 
         centrelines.append(newCentreline)
 
-    add_original_names(centrelines, renamed)
+    add_original_names(centrelines, renaming)
     for centreline in centrelines:
         centreline.add_string_repr()
 
@@ -734,7 +694,7 @@ if __name__ == "__main__":
 
     # EXIT_FILE = f"{dirname(ENTRY_FILE)}/{CAVE_NAME}.th"
 
-    data, renamed = rename_stations(read_survey_file(ENTRY_FILE), FORMAT)
+    data, renaming = rename_stations(read_survey_file(ENTRY_FILE), FORMAT)
 
     # create a named survey
     newSurvey = Survey(name=BASENAME)
@@ -743,7 +703,7 @@ if __name__ == "__main__":
     newSurvey.add_entrance_fix(find_entrance_fix(data, FORMAT, CRSIN))
 
     # read the data to centrelines and add to survey
-    centrelines = make_centrelines_list(data, fmt= FORMAT, renamed=renamed, expand_lrud=EXPAND_LRUD)
+    centrelines = make_centrelines_list(data, fmt= FORMAT, renaming=renaming, expand_lrud=EXPAND_LRUD)
     newSurvey.add_centrelines(centrelines)
 
     # make a formatted string
