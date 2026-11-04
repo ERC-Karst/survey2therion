@@ -234,15 +234,18 @@ def validate_stn_name(stn: str) -> str:
     return stn.replace("!", "exc").replace("'", "quote").replace("`", "revquote").replace("?", "q").replace("*", "ast").replace("#", "hash").replace("$", "dol").replace("%", "perc").replace("&", "amp").replace("=","eq")
 
 def format_dimension(value: str) -> str:
-    """Format a passage dimension in feet. Compass writes missing dimensions as negative values or 999, and we write them as 0"""
+    """Format a passage dimension in feet. Compass writes missing dimensions as negative values or 999, and we write them as "-", which Therion reads as a dimension that wasn't measured"""
     dimension = float(value)
     if dimension < 0 or dimension == 999:
-        dimension = 0
+        return "-"
     return f"{dimension:.2f}"
+
+def parse_dimension(value: str) -> float | None:
+    return None if value.strip() == "-" else float(value)
 
 def parse_measurement( line: str) -> dict:
 
-    rawparts =[elem.strip(" ") for elem in line.split("#")[0].split(" ") if elem != ""] # split the parts by spaces.
+    rawparts = line.split("#")[0].split() # Compass separates the columns by spaces or tabs
 
     if len(rawparts) == 9: # there is no comment.
         parts = rawparts
@@ -364,7 +367,7 @@ def parse_survey_date_comment( line: str ) -> str:
             "month": f"{int(parts[-3]):02d}",
             "day": f"{int(parts[-2]):02d}"}
 
-    return date, comment.strip("\n")
+    return date, comment.strip()
 
 def parse_corrections( line : str) -> dict:
     header = parse_data_header(line)
@@ -442,7 +445,8 @@ def format_station_dimensions(measurement: dict, data_format: dict) -> str:
     # convert to m
     if data_format["units dimensions"] == "metres":
         for dim in ["length", "left", "right", "up", "down"]:
-            measurement[dim] = ft2m(measurement[dim])
+            if measurement[dim] != "-":
+                measurement[dim] = ft2m(measurement[dim])
 
     line = f"{measurement['to']} {measurement['left']} {measurement['up']} {measurement['down']} {measurement['right']}"
     line +="\n"
@@ -612,10 +616,10 @@ def inject_lrud(shot_series, station_dim_series, data_format):
         from_station, left, up, down, right = lrudLine.split(" ")
 
         th_lrudLine = LineLRUD(from_station=from_station, 
-                               left= float(left), 
-                               right= float(right), 
-                               up= float(up), 
-                               down= float(down))
+                               left= parse_dimension(left), 
+                               right= parse_dimension(right), 
+                               up= parse_dimension(up), 
+                               down= parse_dimension(down))
         
         # direction
         normal_vec = np.zeros(3)
@@ -803,7 +807,9 @@ def format_centreline_str(shot_series,
 
         full_stn_dim_series = ""
         for line in station_dim_series:
-            full_stn_dim_series+=line
+            # a station without any measured dimension gets no dimension row
+            if line.split()[1:] != ["-"] * 4:
+                full_stn_dim_series+=line
 
         full_comments = ""
         for line in comments:

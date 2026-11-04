@@ -129,11 +129,11 @@ def calc_splay_from_lrud(normal_vector_dir,lrud, other_normal=None):
     #unit vector pointing up
     unit_vector_z = np.array([0,0,1])
 
-    #extract the left right up down scalar values
-    left_scalar = lrud.left
-    right_scalar = lrud.right
-    up_scalar = lrud.up
-    down_scalar = lrud.down
+    # a dimension that wasn't measured makes no splay
+    left_scalar = lrud.left or 0.0
+    right_scalar = lrud.right or 0.0
+    up_scalar = lrud.up or 0.0
+    down_scalar = lrud.down or 0.0
 
     #calculate the unit vector to the right and down by taking the vector product
     unit_vector_right = np.cross(normal_vector_dir,unit_vector_z) 

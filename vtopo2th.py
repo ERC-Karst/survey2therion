@@ -7,6 +7,8 @@ This provides a parser for converting VisualTopo file structures to therion
 """
 
 import argparse
+import string
+import unicodedata
 from os.path import abspath, dirname, split, join
 
 from os import makedirs
@@ -17,6 +19,107 @@ from helpers.therion_classes import *
 
 
 ### utility functions. 
+
+# Therion accepts these characters in a station name. The second set is only accepted after the first character
+_STATION_FIRST_CHARS = set(string.ascii_letters + string.digits + "_/")
+_STATION_OTHER_CHARS = _STATION_FIRST_CHARS | set("-+*.,'")
+
+def is_valid_station_name(name: str) -> bool:
+    return name[0] in _STATION_FIRST_CHARS and all(ch in _STATION_OTHER_CHARS for ch in name[1:])
+
+def rewrite_station_name(name: str) -> str:
+    """Strip the accents from the name, then replace each character Therion rejects with an underscore"""
+    letters = "".join(ch for ch in unicodedata.normalize("NFKD", name) if unicodedata.category(ch) != "Mn")
+    return "".join(ch if ch in (_STATION_FIRST_CHARS if i == 0 else _STATION_OTHER_CHARS) else "_" for i, ch in enumerate(letters))
+
+_TRO_SHOT_STATIONS = re.compile(r"^(\s*)(\S+)(\s+)(\S+)")
+_TRO_ENTRANCE = re.compile(r"^(Entree\s)(.+)$")
+_TROX_STATIONS = re.compile(r'\b(Dep|Arr|Station)="([^"]*)"')
+_TROX_ENTRANCE = re.compile(r"(<Entree>)([^<]*)")
+
+def is_tro_shot(line: str) -> bool:
+    fields = line.split(";")[0].split()
+    return len(fields) >= 5 and re.fullmatch(r"[0-9.]+", fields[2]) is not None
+
+def rename_stations(data: list[str], fmt: str) -> tuple[list[str], dict[str, str]]:
+    """Rename the stations whose name Therion rejects. Valid names stay unchanged.
+    A rewritten name already in use gets a numbered suffix, so two stations never merge.
+
+    Returns
+    -------
+    tuple
+        the data with the new names, and the original name of each renamed station keyed by its new name
+    """
+    if fmt == "tro":
+        patterns = [(_TRO_ENTRANCE, [2])]
+        shot_pattern = (_TRO_SHOT_STATIONS, [2, 4])
+    else:
+        patterns = [(_TROX_STATIONS, [2]), (_TROX_ENTRANCE, [2])]
+        shot_pattern = None
+
+    def patterns_of(line):
+        if shot_pattern is not None and is_tro_shot(line):
+            return patterns + [shot_pattern]
+        return patterns
+
+    # a tro shot starting with * continues from the station where the previous shot ended
+    names = list(dict.fromkeys(match[group] for line in data for pattern, groups in patterns_of(line)
+                               for match in pattern.finditer(line) for group in groups if match[group] not in ("*", "")))
+    taken = {name for name in names if is_valid_station_name(name)}
+    new_names, renamed = {}, {}
+    for name in names:
+        if name in taken:
+            continue
+        new_name = rewrite_station_name(name)
+        suffix = 2
+        while new_name in taken:
+            new_name = f"{rewrite_station_name(name)}_{suffix}"
+            suffix += 1
+        taken.add(new_name)
+        new_names[name] = new_name
+        renamed[new_name] = name
+
+    def replace(match, groups):
+        # replace the station groups from the last one, so the positions of the earlier groups stay right
+        text = match[0]
+        for group in sorted(groups, reverse=True):
+            start, end = match.start(group) - match.start(), match.end(group) - match.start()
+            text = text[:start] + new_names.get(match[group], match[group]) + text[end:]
+        return text
+
+    renamed_data = []
+    for line in data:
+        for pattern, groups in patterns_of(line):
+            line = pattern.sub(lambda match: replace(match, groups), line)
+        renamed_data.append(line)
+    return renamed_data, renamed
+
+def add_original_names(centrelines: list[Centreline], renamed: dict[str, str]) -> None:
+    """Keep the original name of each renamed station as its comment, unless the station has a comment of its own.
+    The comment goes in the first centreline using the station"""
+    commented = {station.name for centreline in centrelines for station in centreline.commented_stations}
+    for new_name, original in renamed.items():
+        if new_name in commented:
+            continue
+        for centreline in centrelines:
+            stations = {line.from_station for line in centreline.data} | {line.to_station for line in centreline.data} \
+                | {equate.stn1 for equate in centreline.equates} | {equate.stn2 for equate in centreline.equates}
+            if new_name in stations:
+                centreline.add_station_line(StationWithComment(new_name, original))
+                break
+
+def read_survey_file(path: str) -> list[str]:
+    """Read the lines of a VisualTopo file. VisualTopo writes latin-1, but a file saved again by another program is often UTF-8"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        raw.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        encoding = "latin-1"
+    with open(path, "r", encoding=encoding) as f:
+        return f.readlines()
+
 def joinlist(l : list[str])-> str:
     newstr = ""
 
@@ -142,18 +245,9 @@ def return_centreline_params_trox(data):
                     end.append(c-1)
                 start.append(c+1)
 
-            reg_explodate = re.findall(r'(?<=Date\=")\d\d\/\d\d\/\d\d\d\d', l)
-            # what if no explo date is given?
-            if len(reg_explodate) > 0:
-                reg_explodate = [elem for elem in reg_explodate[0].split("/")]
-            else:
-                reg_explodate = ["01", "01", "2001"]
-            explodate = "{dd}.{mm}.{yy}".format(yy =reg_explodate[2][2:], mm =reg_explodate[1], dd = reg_explodate[0])
-
-            if len(explodate) == 0:
-                survey_dates.append('')
-            else:
-                survey_dates.append(re.sub(r"/",".",explodate))
+            # a block without date leaves the survey undated
+            explodate = re.findall(r'(?<=Date\=")\d\d/\d\d/\d\d\d\d', l)
+            survey_dates.append(explodate[0] if len(explodate) > 0 else '')
             tp = re.findall(r"(?<=Topo réalisée par )[\w+\s]*",l)
             if len(tp) == 0:
                 surveyor_groups.append('')
@@ -191,7 +285,7 @@ def return_centreline_params_tro(data: list[str]) -> tuple:
                 end.append(c-1)
             start.append(c+1)
 
-            explodate = re.findall(r"\d\d.\d\d.\d\d", l)
+            explodate = re.findall(r"\d\d.\d\d.\d\d(?:\d\d)?", l)
             if len(explodate) == 0:
                 survey_dates.append('')
             else:
@@ -206,19 +300,16 @@ def return_centreline_params_tro(data: list[str]) -> tuple:
 
     return surveyor_groups,survey_dates,start,end
 
-def parseFloat(x: str) -> float:
-        try: 
-            X = float(x)
-            return X
-        
-        # when the value is starred.
-        except ValueError:
-            X = 0.
-            return X
+def parse_dimension(x: str | None) -> float | None:
+    """Parse a passage dimension. VisualTopo stars a dimension that wasn't measured in tro files, and leaves it out in trox files"""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
-def parse_CommentedStations(lines : list[str]) -> list[StationWithComment]:
-    """Parses station comments
+def parse_CommentedStations(lines : list[str], format : str) -> list[StationWithComment]:
+    """Parses the shot comments, as comments of the from station of the shot
 
     Parameters
     ----------
@@ -232,14 +323,22 @@ def parse_CommentedStations(lines : list[str]) -> list[StationWithComment]:
     list[StationWithComment]
         a list of commented station objects
     """
-    parsed_lines = [[elem for elem in line.split(";") if elem != ""] for line in lines[1:]]
     stations_list = []
-    for line in parsed_lines: 
-        if len(line) > 1:
-            stn_name = [elem for elem in line[0].split(" ") if elem != ""][0]
-            comment = line[1]
-            station = StationWithComment(stn_name,comment)
-            stations_list.append(station)
+    if format == "tro":
+        parsed_lines = [[elem for elem in line.split(";") if elem != ""] for line in lines[1:]]
+        for line in parsed_lines: 
+            if len(line) > 1:
+                stn_name = [elem for elem in line[0].split(" ") if elem != ""][0]
+                comment = line[1]
+                station = StationWithComment(stn_name,comment)
+                stations_list.append(station)
+    else:
+        # a trox shot holds its comment in the next line
+        for previous, line in zip(lines, lines[1:]):
+            if "<Commentaire>" in line and "<Visee Dep=" in previous:
+                stn_name = previous.split('Dep="')[1].split('"')[0]
+                comment = line.split("<Commentaire>")[1].split("</Commentaire>")[0]
+                stations_list.append(StationWithComment(stn_name, comment))
 
     return stations_list
 
@@ -269,10 +368,10 @@ def parse_LRUDS(lines: list[str], format : str) -> list[LineLRUD]:
 
         for line in lines:
             arr = None
-            l = "0.00"
-            r = "0.00"
-            u = "0.00"
-            d = "0.00"
+            l = None
+            r = None
+            u = None
+            d = None
             
             if "Arr=" in line:
                 arr = line.split("Arr=")[1].split('"')[1]
@@ -287,9 +386,7 @@ def parse_LRUDS(lines: list[str], format : str) -> list[LineLRUD]:
                 d = line.split("B=")[1].split('"')[1]
 
             if arr is not None:
-                empty_lrud = float(l) + float(r) + float(u) +float(d)
-                if empty_lrud > 0:
-                    LRUDlines.append([arr, l,r,u,d])
+                LRUDlines.append([arr, l,r,u,d])
         
     else:
         LRUDlines = [[]]
@@ -297,19 +394,19 @@ def parse_LRUDS(lines: list[str], format : str) -> list[LineLRUD]:
     lrud_lines = []
 
     for c,line in enumerate(LRUDlines):
-        if "*" in line[0] and len(line) >=9:
-            LRUDline =LineLRUD(LRUDlines[c][1],parseFloat(line[5]),parseFloat(line[6]),parseFloat(line[7]),parseFloat(line[8])) 
-        elif len(line) >=9:
-            LRUDline =LineLRUD(line[1],parseFloat(line[5]),parseFloat(line[6]),parseFloat(line[7]),parseFloat(line[8]))
+        if len(line) >=9:
+            LRUDline =LineLRUD(line[1],parse_dimension(line[5]),parse_dimension(line[6]),parse_dimension(line[7]),parse_dimension(line[8]))
         elif len(line) ==5:
-            LRUDline =LineLRUD(line[0],parseFloat(line[1]),parseFloat(line[2]),parseFloat(line[3]),parseFloat(line[4]))
+            LRUDline =LineLRUD(line[0],parse_dimension(line[1]),parse_dimension(line[2]),parse_dimension(line[3]),parse_dimension(line[4]))
 
         else:
             print("skipping empty line {}".format(c))
             print(line)
             continue
 
-        lrud_lines.append(LRUDline)
+        # a station without any measured dimension gets no dimension row
+        if any(dim is not None for dim in LRUDline.dims):
+            lrud_lines.append(LRUDline)
 
     return lrud_lines
 
@@ -470,7 +567,7 @@ def parse_diving_data(lines: list[str], format: str, station_depth_lookup: dict)
     return dataLines, equateLines
 
 
-def make_centrelines_list(data : list[str], fmt: str, expand_lrud: bool = True ) -> list[Centreline]:
+def make_centrelines_list(data : list[str], fmt: str, renamed: dict[str, str], expand_lrud: bool = True ) -> list[Centreline]:
     """The main parser function: 
     -reads the original data file, 
     -finds the different centreline blocks
@@ -513,10 +610,13 @@ def make_centrelines_list(data : list[str], fmt: str, expand_lrud: bool = True )
             for elem in data[start-1].split(" ")[1:]:
                 header += elem.split("=")[-1].strip('"')+" "
 
+        # the trox gives the senses of the readings as three attributes, and the tro joins them with commas
+        header = re.sub(r"\b(Dir|Inv) (Dir|Inv) (Dir|Inv)\b", r"\1,\2,\3", header)
+
         newCentreline.parse_strategy(header)
         newCentreline.parse_units(header)
 
-        station_lines = parse_CommentedStations(data[start:end+1])
+        station_lines = parse_CommentedStations(data[start:end+1], fmt)
 
         if "normal" in newCentreline.strategy.type:
             lrudLines = parse_LRUDS(data[start:end], format = fmt)
@@ -544,8 +644,11 @@ def make_centrelines_list(data : list[str], fmt: str, expand_lrud: bool = True )
 
 
 
-        newCentreline.add_string_repr()
         centrelines.append(newCentreline)
+
+    add_original_names(centrelines, renamed)
+    for centreline in centrelines:
+        centreline.add_string_repr()
 
     return centrelines
 
@@ -631,8 +734,7 @@ if __name__ == "__main__":
 
     # EXIT_FILE = f"{dirname(ENTRY_FILE)}/{CAVE_NAME}.th"
 
-    with open (ENTRY_FILE,'r', encoding='latin-1') as f:
-            data = f.readlines()
+    data, renamed = rename_stations(read_survey_file(ENTRY_FILE), FORMAT)
 
     # create a named survey
     newSurvey = Survey(name=BASENAME)
@@ -641,7 +743,7 @@ if __name__ == "__main__":
     newSurvey.add_entrance_fix(find_entrance_fix(data, FORMAT, CRSIN))
 
     # read the data to centrelines and add to survey
-    centrelines = make_centrelines_list(data, fmt= FORMAT, expand_lrud=EXPAND_LRUD)
+    centrelines = make_centrelines_list(data, fmt= FORMAT, renamed=renamed, expand_lrud=EXPAND_LRUD)
     newSurvey.add_centrelines(centrelines)
 
     # make a formatted string

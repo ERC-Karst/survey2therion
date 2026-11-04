@@ -39,13 +39,18 @@ class StationWithComment:
         else:
             self.command = f'station {self.name} "{self.comment}"'
 
+def format_dimension(value: float | None) -> str:
+    """Format a passage dimension. Therion reads "-" as a dimension that wasn't measured"""
+    return "-" if value is None else f"{value}"
+
 @dataclass
 class LineLRUD:
+    """The passage dimensions at a station. A dimension is None when it wasn't measured"""
     from_station : str
-    left : float
-    right : float 
-    up : float
-    down : float
+    left : float | None
+    right : float | None
+    up : float | None
+    down : float | None
     inclination : float = field(init=False)
     azimuth : float = field(init=False)
 
@@ -153,12 +158,8 @@ class Units:
         else:
             line = self.input_str
         
-        if self.fmt == "tro":
-        # now check whether the date has been given at all.
+        if self.fmt == "tro" or self.fmt == "trox":
             tape, clino, _, compass, declination, _, where_dims = line.split(" ")[:7]
-
-        elif self.fmt== "trox":
-            tape, clino, _, compass, declination, _, _, _, where_dims= line.split('"')[0].split(" ")[:9]
         
         elif self.fmt == "survex default":
             tape = "Deca"
@@ -385,7 +386,7 @@ class Centreline:
         # appending the station dimension data to the centreline string representation     
         for lrud_line in self.lrud_data:
             formatted_lrud += f"""
-        {lrud_line.from_station}\t{lrud_line.left}\t{lrud_line.right}\t{lrud_line.up}\t{lrud_line.down}\t"""
+        {lrud_line.from_station}\t{format_dimension(lrud_line.left)}\t{format_dimension(lrud_line.right)}\t{format_dimension(lrud_line.up)}\t{format_dimension(lrud_line.down)}\t"""
 
         # appending equates at the end of the centreline block
         for equate_line in self.equates:

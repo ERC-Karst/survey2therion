@@ -29,11 +29,11 @@ def calc_splay_from_lrud(station_coordinates, normal_vector_dir,lrud, other_norm
     unit_vector_z = np.array([0,0,1])
     #we normalize the normal vector by its norm    
     normal_vector_plan_normalized =  (normal_vector_dir/np.linalg.norm(normal_vector_dir))
-    #extract the left right up down scalar values
-    left_scalar = lrud[0]
-    right_scalar = lrud[1]
-    up_scalar = lrud[2]
-    down_scalar = lrud[3]
+    # a dimension that wasn't measured makes no splay
+    left_scalar = lrud[0] or 0.0
+    right_scalar = lrud[1] or 0.0
+    up_scalar = lrud[2] or 0.0
+    down_scalar = lrud[3] or 0.0
 
     #calculate the unit vector to the right and down by taking the vectorial product
     unit_vector_right = np.cross(normal_vector_plan_normalized,unit_vector_z) 
