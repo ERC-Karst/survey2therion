@@ -8,8 +8,9 @@ This provides a parser for converting Toporobot file structures to therion
 
 import datetime
 import argparse
-from os.path import abspath, split, join, isdir, isfile
-import subprocess
+from os.path import abspath, split, join, isfile
+from os import makedirs
+from shutil import copy
 from math import sqrt
 import numpy as np
 
@@ -431,7 +432,7 @@ def find_entrances( parsed_data : list ) -> list:
     return entrances
     
 
-def find_equates( parsed_data : list , tie_points : dict, instrument_codes: dict) -> list:
+def find_equates( parsed_data : list , tie_points : dict, instrument_codes: dict, inst_key_col: int = 2) -> list:
     """Loops over the parsed data and identified tie points and looks for unique session keys in measurement shots
 
     Parameters
@@ -453,7 +454,8 @@ def find_equates( parsed_data : list , tie_points : dict, instrument_codes: dict
 
     for key, value in tie_points.items():
 
-        parsed_series_measurements = parse_series_measurements(parsed_data, key, equates, instrument_codes)
+        # parse_all_series collects the equates of zero-length shots, so we drop them here
+        parsed_series_measurements = parse_series_measurements(parsed_data, key, [], instrument_codes, inst_key_col)
         if len(parsed_series_measurements["shot_data"])>0:
             start_tie = value[0]
             start_station = (str(key), parsed_series_measurements["shot_data"][0][0])
@@ -687,24 +689,23 @@ def format_fixes_str(fixes : list) -> list:
     
     return fixes_str
 
+def is_written_equate(equate) -> bool:
+    """Returns true if the equate joins two series, or two stations of one series through a zero-length shot"""
+    return equate[1][0] != equate[0][0] or equate[2] == 1
+
 def format_equates_str(equates: list, keys) -> list:
     
     equates_str = []
     for equate in equates:
-        # don't allow for the case that a shot between two stations of a single shot survey can be equated.
-        
-        if equate[1][0] != equate[0][0] or (equate[1][0] == equate[0][0] and equate[2] == 1):
-
-
-            # don't allow for equates with non-existent surveys. 
-            if int(equate[1][0]) not in keys and int(equate[0][0]) not in keys:
-                equates_str.append(f"equate {equate[0][1]}_{equate[0][0]} {equate[1][1]}_{equate[1][0]}\n")
-            elif int(equate[0][0]) not in keys:
-                equates_str.append(f"equate {equate[0][1]}_{equate[0][0]} {equate[1][1]}@{equate[1][0]}\n")
-            elif int(equate[1][0]) not in keys:
-                equates_str.append(f"equate {equate[0][1]}@{equate[0][0]} {equate[1][1]}_{equate[1][0]}\n")
-            else:
-                equates_str.append(f"equate {equate[0][1]}@{equate[0][0]} {equate[1][1]}@{equate[1][0]}\n")
+        # don't allow for equates with non-existent surveys. 
+        if int(equate[1][0]) not in keys and int(equate[0][0]) not in keys:
+            equates_str.append(f"equate {equate[0][1]}_{equate[0][0]} {equate[1][1]}_{equate[1][0]}\n")
+        elif int(equate[0][0]) not in keys:
+            equates_str.append(f"equate {equate[0][1]}_{equate[0][0]} {equate[1][1]}@{equate[1][0]}\n")
+        elif int(equate[1][0]) not in keys:
+            equates_str.append(f"equate {equate[0][1]}@{equate[0][0]} {equate[1][1]}_{equate[1][0]}\n")
+        else:
+            equates_str.append(f"equate {equate[0][1]}@{equate[0][0]} {equate[1][1]}@{equate[1][0]}\n")
 
     return equates_str
 
@@ -939,9 +940,51 @@ def format_comments(parsed_comments):
     return _COMMENTS_STRING.format(comments=comments)
 
 
+def to_degrees_direction(compass: float, clino: float, units: dict) -> tuple:
+    """Convert toporobot compass and clino readings to an azimuth and an inclination from the horizontal, both in degrees"""
+    compass_unit = units["compass"]["unit"]
+    clino_unit = units["clino"]["unit"]
+
+    if "grads" in compass_unit:
+        compass = grad2deg(compass)
+    if "inverse" in compass_unit:
+        # a backsight reading points from the to station back to the from station
+        compass = (compass + 180) % 360
+
+    if clino_unit == "percentage":
+        clino = rad2deg(np.arctan(clino / 100))
+    elif "grads" in clino_unit:
+        clino = grad2deg(clino)
+
+    if "zenith" in clino_unit:
+        clino = 90 - clino
+    elif "nadir" in clino_unit:
+        clino = clino - 90
+    elif "inverse" in clino_unit:
+        clino = -clino
+
+    return compass, clino
+
 def inject_lrud(shot_data, station_data, parsed_instrument_codes):
     
     splay_shot_data = []
+
+    # instrument key 0 has no instrument code, and we write its shots in grads
+    key_0_units = {"compass": {"unit": "grads"}, "clino": {"unit": "grads"}}
+
+    # we compute the splays from the true direction of each shot, so they are written in degrees whatever the instrument
+    true_shot_data = []
+    for from_station, to_station, length, compass, clino, explo_key, ik in shot_data:
+        try:
+            compass, clino = to_degrees_direction(float(compass), float(clino), parsed_instrument_codes.get(str(ik), key_0_units))
+        except ValueError:
+            pass
+        true_shot_data.append([from_station, to_station, length, compass, clino, explo_key, ik])
+    shot_data = true_shot_data
+
+    centreline_units = Units("empty")
+    centreline_units.compass = "degrees"
+    centreline_units.clino = "degrees"
 
     # set up a counter to keep track of where to insert the splay lines.
     lrud_counter = 0
@@ -949,12 +992,6 @@ def inject_lrud(shot_data, station_data, parsed_instrument_codes):
     for c, lrudLine in enumerate(station_data):
         from_station, left, right, up, down, ik = lrudLine
         th_lrudLine = LineLRUD(from_station=from_station, left= float(left), right= float(right), up= float(up), down= float(down))
-        
-        units_dict = parsed_instrument_codes[ik]
-        centreline_units = Units("empty")
-        centreline_units.length=units_dict["length"]["unit"]
-        centreline_units.clino=units_dict["clino"]["unit"]
-        centreline_units.compass=units_dict["compass"]["unit"]
         
         # direction
         normal_vec = np.zeros(3)
@@ -1008,7 +1045,7 @@ def inject_lrud(shot_data, station_data, parsed_instrument_codes):
 
 
                         # now we know we have found good station. 
-                        if isinstance(shot_data[k+1], NormalDataLine):
+                        if shot_data[k+1][0] == lrud_station:
                             dataLine2= shot_data[k+1]
                             from_station, to_station, length, compass, clino, _, _ = dataLine2
 
@@ -1045,8 +1082,7 @@ def inject_lrud(shot_data, station_data, parsed_instrument_codes):
                             cartesian_1 = spherical2cartesian(comp1, clino1, centreline_units)
                             cartesian_2 = spherical2cartesian(comp2, clino2, centreline_units)
                 
-                            # unit bissector vector. 
-                            normal_vec = (cartesian_1 + cartesian_2) / np.linalg.norm(cartesian_1 + cartesian_2)
+                            normal_vec = bisector(cartesian_1, cartesian_2)
 
                             # splay from normal vector and lruds 
                             station_counter = k+1
@@ -1132,16 +1168,18 @@ equate {station_data[0][0]} {station_data[1][0]}
         date_str = format_date_str(session_metadata, session_key)
         data_entry_str = "" 
        
-        for inst_key in set(inst_keys):
+        for inst_key in sorted(set(inst_keys), key=int):
             print(f"now working on survey {series_key}")
             data_header, flag = format_data_header(parsed_instcodes, inst_key)
             if inst_key == 12:
                 print("on instrument key 12:", data_header)
 
+            # instrument key 0 has no instrument code, so we read the codes of the smallest other key
+            codes_key = inst_key
             if inst_key == "0":
                 topocomment = f"""\n## Probably a GhTopo instrument key 0
 ## Toporobot instrument code comment: fixed point or entrance."""
-                inst_key = str(min([int(elem) for elem in set(inst_keys)-{inst_key}]))
+                codes_key = str(min([int(elem) for elem in set(inst_keys)-{inst_key}]))
                 data_header = """
 units compass clino grads
 units length metres
@@ -1174,7 +1212,7 @@ data normal from to length compass clino"""
                 _from, to, length, compass, clino, _, ik = line
 
                 # add possibility to have back compass or backclino readings as well as nadiral angles for inclinations.
-                clino_code = float(instcodes[inst_key][1])
+                clino_code = float(instcodes[codes_key][1])
                 
                 if clino_code == 399:
                     clino = float(clino) 
@@ -1198,6 +1236,7 @@ flags {flag}
 {shot_entries}
 flags not {flag}
 
+units compass clino degrees
 calibrate clino 0 ## removing any previous nadiral / zenithal calibrations.
 data normal from to length compass clino
 {splay_entries}
@@ -1216,6 +1255,7 @@ flags {flag}
 {shot_entries}
 flags not {flag}
 
+units compass clino degrees
 calibrate clino 0 ## removing any previous nadiral / zenithal calibrations.
 data normal from to length compass clino
 {splay_entries}
@@ -1229,6 +1269,7 @@ data dimensions station left right up down
 {data_header}
 {shot_entries}
 
+units compass clino degrees
 calibrate clino 0 ## removing any previous nadiral / zenithal calibrations.
 data normal from to length compass clino
 {splay_entries}
@@ -1280,6 +1321,8 @@ def format_full_therion_file(basename, parsed_data, keys, series, equates, comme
 
 
     fixes = find_fixes(parsed_data)
+    # equates_str lines up with equates, so the fixes below can rewrite the matching equate line
+    equates = [equate for equate in equates if is_written_equate(equate)]
     equates_str = format_equates_str(equates, keys)
 
 
@@ -1415,18 +1458,14 @@ if __name__ == "__main__":
 
     ## SET UP THE EXPORT DIRECTORY
     WRITE_PATH =  abspath(OUTPUT_DIRECTORY)
-    if not isdir(WRITE_PATH):
-        subprocess.check_output(f"md {join(WRITE_PATH)}", shell=True)
-    
     OUTPUTS_FILEPATH = join(WRITE_PATH, "outputs")
-    if not isdir(OUTPUTS_FILEPATH):
-        subprocess.check_output(f"md {OUTPUTS_FILEPATH}", shell=True)
+    makedirs(OUTPUTS_FILEPATH, exist_ok=True)
     
-    subprocess.check_output(f"copy  {ENTRY_FILE} {join(WRITE_PATH)}\\", shell=True)
+    copy(ENTRY_FILE, WRITE_PATH)
 
 
     ## READING IN .
-    DATA = read_file(ENTRY_FILE)
+    DATA = read_file(ENTRY_FILE, ENCODING)
     PARSED, COMMENTS = parse_keys(DATA)
     find_entrances(PARSED)
     PARSED_COMMENTS = parse_station_comments(COMMENTS)
@@ -1434,7 +1473,7 @@ if __name__ == "__main__":
     INST_CODES = find_instrument_codes(PARSED)
     PARSED_INST_CODES = parse_instrument_codes(INST_CODES)
     TIES = find_tie_points(PARSED, SERIES_KEYS)
-    EQUATES = find_equates(PARSED, TIES, PARSED_INST_CODES)
+    EQUATES = find_equates(PARSED, TIES, PARSED_INST_CODES, inst_key_col=INST_KEY_COL)
     SERIES = parse_all_series(PARSED, SERIES_KEYS, EQUATES, PARSED_INST_CODES, inst_key_col=INST_KEY_COL)
     SESSION_METADATA = find_session_metadata(PARSED)
     PARSED_INST_CODE_COMMENTS = parse_instrument_code_comments(COMMENTS, INST_CODES)

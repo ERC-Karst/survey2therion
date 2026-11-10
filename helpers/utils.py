@@ -50,6 +50,13 @@ def spherical2cartesian(compass, clino, units):
     
     return uv
 
+def bisector(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Return the unit vector halfway between two unit vectors. Opposite vectors have no bisector, so we return the first one"""
+    total = u + v
+    if np.linalg.norm(total) < 1.e-5:
+        return u
+    return total / np.linalg.norm(total)
+
 def cartesian2spherical(u: np.ndarray, units, vert_threshold: float = 70) -> tuple:
     """Returns the angular inclination and angle from north from a vector in cartesian
     coordinates, depending on the current units of a centreline block.
@@ -122,11 +129,11 @@ def calc_splay_from_lrud(normal_vector_dir,lrud, other_normal=None):
     #unit vector pointing up
     unit_vector_z = np.array([0,0,1])
 
-    #extract the left right up down scalar values
-    left_scalar = lrud.left
-    right_scalar = lrud.right
-    up_scalar = lrud.up
-    down_scalar = lrud.down
+    # a dimension that wasn't measured makes no splay
+    left_scalar = lrud.left or 0.0
+    right_scalar = lrud.right or 0.0
+    up_scalar = lrud.up or 0.0
+    down_scalar = lrud.down or 0.0
 
     #calculate the unit vector to the right and down by taking the vector product
     unit_vector_right = np.cross(normal_vector_dir,unit_vector_z) 
@@ -228,8 +235,7 @@ def inject_lrud(centreline, lrudlines, datalines):
                                     cartesian_1 = spherical2cartesian(comp1, clino1, centreline.units)
                                     cartesian_2 = spherical2cartesian(comp2, clino2, centreline.units)
                         
-                                    # unit bissector vector. 
-                                    normal_vec = (cartesian_1 + cartesian_2) / np.linalg.norm(cartesian_1 + cartesian_2)
+                                    normal_vec = bisector(cartesian_1, cartesian_2)
 
                                     # splay from normal vector and lruds 
                                     station_counter = k+1

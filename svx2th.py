@@ -8,12 +8,14 @@ This provides a parser for converting "survex" file structures to therion
 
 
 import re
+from itertools import accumulate
 import argparse
 import pandas as pd
 from os import walk, makedirs, listdir
-from os.path import abspath, isfile, isdir, dirname, join, exists, split, normpath
+from os.path import abspath, isfile, isdir, dirname, join, exists, split, normpath, relpath
 from helpers import therion_classes as th
 from helpers.utils import *
+from helpers.station_names import station_renaming, stations_of, add_original_names
 encodings = ['utf-8', 'mac_roman', 'iso-8859-1', 'iso-8859-3', 'iso-8859-15', 'cp1252', 'cp437', 'cp850', 'ansi']
 
 def open_file_with_encodings(file_path, encodings):
@@ -83,11 +85,11 @@ def reformat_begin(file_path):
             line = line.rstrip(line[-1])
         if line.lower().startswith('*begin') and len(line.split())>1:
             survey_name = line.split()[1]
-            return f'survey {survey_name.lower()} -title "{survey_name}"'
+            return f'survey {survey_name} -title "{survey_name}"'
         else:
             return None
 
-def reformat_equates(file_path,list_all_address):
+def reformat_equates(file_path,list_all_address,renaming):
     lines = [line.strip().strip('   ') for line in open(file_path, 'r', encoding='utf-8')]
     list_strings = ['']
     for line in lines:
@@ -99,9 +101,9 @@ def reformat_equates(file_path,list_all_address):
             # print(line)
             parts = line.split()
             # lst.append([line.split(' ')[1],line.split(' ')[2]])
-            equate_from = reformat_address(parts[1],list_all_address)
-            equate_to = reformat_address(parts[2],list_all_address)
-            list_strings.append(f'equate {equate_from.lower()} {equate_to.lower()}')
+            equate_from = rename_address(reformat_address(parts[1],list_all_address), renaming)
+            equate_to = rename_address(reformat_address(parts[2],list_all_address), renaming)
+            list_strings.append(f'equate {equate_from} {equate_to}')
 
         # elif line.lower().startswith(';') and '*equate' in line:
         #     parts = line.split(' ')
@@ -112,7 +114,7 @@ def reformat_equates(file_path,list_all_address):
     return list_strings
 
 
-def reformat_fixes(file_path,list_all_address):
+def reformat_fixes(file_path,list_all_address,renaming):
     lines = [line.strip() for line in open(file_path, 'r', encoding='utf-8')]
     lst = ['']
     for line in lines:
@@ -120,8 +122,8 @@ def reformat_fixes(file_path,list_all_address):
             line = line.rstrip(line[-1])
         if line.lower().startswith('*fix'):
             parts =line.split()
-            station_name = reformat_address(parts[1],list_all_address)
-            lst.append(f'fix {station_name.lower()} {" ".join(parts[-3:])}')
+            station_name = rename_address(reformat_address(parts[1],list_all_address), renaming)
+            lst.append(f'fix {station_name} {" ".join(parts[-3:])}')
 
         # elif line.lower().startswith(';') and '*fix' in line:
         #     parts =line.split(' ')
@@ -131,7 +133,7 @@ def reformat_fixes(file_path,list_all_address):
 
     return lst
 
-def reformat_entrances(file_path,list_all_address):
+def reformat_entrances(file_path,list_all_address,renaming):
     lines = [line.strip() for line in open(file_path, 'r', encoding='utf-8')]
     lst = ['']
     for line in lines:
@@ -139,8 +141,8 @@ def reformat_entrances(file_path,list_all_address):
             line = line.rstrip(line[-1])
         if line.lower().startswith('*entrance'):
             parts =line.split()
-            station_name = reformat_address(parts[1],list_all_address)
-            lst.append(f'station {station_name.lower()} "" entrance')
+            station_name = rename_address(reformat_address(parts[1],list_all_address), renaming)
+            lst.append(f'station {station_name} "" entrance')
 
         # elif line.lower().startswith(';') and '*entrance' in line:
         #     parts =line.split(' ')
@@ -199,8 +201,33 @@ def reformat_address(address,list_all_address):
             # Create the 'beginning' and 'end' strings
             beginning = '.'.join(address_split[-index:])
             end = '.'.join(address_split[:-index][::-1])
-        return '@'.join([beginning.lower(),end.lower()])
+        return '@'.join([beginning,end])
                
+def rename_address(address, renaming):
+    """Rename the station of an address of the form station@survey"""
+    station, at, survey = address.partition("@")
+    return renaming.get(station, station) + at + survey
+
+def index_station_names(file_path, list_all_address):
+    """Get the stations an index file equates, fixes or marks as entrance"""
+    names = []
+    for line in open(file_path, 'r', encoding='utf-8'):
+        args = command_args(line, "*equate") or command_args(line, "*fix") or command_args(line, "*entrance") or []
+        addresses = args[:2] if command_args(line, "*equate") else args[:1]
+        names += [reformat_address(address, list_all_address).partition("@")[0] for address in addresses]
+    return names
+
+def survey_station_names(surveys):
+    """Get the stations of the surveys and of their children"""
+    names = []
+    for survey in surveys:
+        names += [name for centreline in survey.centrelines for name in stations_of(centreline)]
+        names += [station.name for centreline in survey.centrelines for station in centreline.commented_stations]
+        names += [name for equate in survey.equates for name in (equate.stn1, equate.stn2)]
+        names += [fix.name.partition("@")[0] for fix in survey.entrance_fixes]
+        names += survey_station_names(survey.children)
+    return names
+
 #### BEGIN NINA AWESOMENESS
 class NameNotFoundError(Exception):
     pass
@@ -214,9 +241,9 @@ def extract_name_from_svx(file_path) -> list:
             names = []
             
             for line in file:
-                if line.lower().startswith('*begin') and len(line.split())>1 :#or line.startswith('*BEGIN'):
-                    # Split the line and get the second part which is the name
-                    names.append(line.split()[1])
+                args = command_args(line, "*begin")
+                if args:
+                    names.append(args[0])
            
     except UnicodeDecodeError as e:
         print(f"Error while reading file {file_path}: {e}")
@@ -252,7 +279,12 @@ def extract_includes_from_svx(file_path, include_commented=False):
     return includes
 
 
-def process_svx_file(directory, rel_path_to_file, path_to_data_file=[], alternate_path={}, include_commented=False):
+def process_svx_file(directory, rel_path_to_file, path_to_data_file=None, alternate_path=None, include_commented=False):
+    if path_to_data_file is None:
+        path_to_data_file = []
+    if alternate_path is None:
+        alternate_path = {}
+
     # here split the relpath to the file from directory.
 
     subdirectory, file = split(rel_path_to_file)
@@ -330,7 +362,11 @@ def process_svx_file(directory, rel_path_to_file, path_to_data_file=[], alternat
 
     return alternate_path
 
-def process_svx_files(directory, path_to_data_file=[], alternate_path={}):
+def process_svx_files(directory, path_to_data_file=None, alternate_path=None):
+    if path_to_data_file is None:
+        path_to_data_file = []
+    if alternate_path is None:
+        alternate_path = {}
     for file in listdir(directory):
         if file.lower().endswith('.svx'):
             process_svx_file(directory, file, path_to_data_file=path_to_data_file, alternate_path=alternate_path)
@@ -347,6 +383,13 @@ def read_raw_data(fp) -> list:
     file.close()
     return contents
 
+def command_args(line, command):
+    """Return the arguments of the given survex command if the line holds this command, or None otherwise"""
+    words = line.split(";")[0].split()
+    if words and words[0].lower() == command:
+        return words[1:]
+    return None
+
 def find_comments(data) -> list:
     comments = [elem for elem in data if elem.startswith(";")]
     return comments
@@ -354,7 +397,7 @@ def find_comments(data) -> list:
 def is_data_file(data) -> bool:
     isdatafile = False
     for line in data:
-        if line.lower().startswith("*begin"):
+        if command_args(line, "*begin") is not None:
             isdatafile = True
     return isdatafile
 
@@ -362,28 +405,25 @@ def find_entrance(data):
     entrances = []
 
     for line in data:
-        if line.lower().startswith("*entrance"):
-            _match = re.findall(r"(?<=entrance\s).+",line[:10].lower()+line[10:])[0]
-            entrances.append(_match)
+        args = command_args(line, "*entrance")
+        if args:
+            entrances.append(" ".join(args))
 
     return entrances
 
 def find_fixes(data, maxlevel):
     fixes = []
-    _match = None
     for line in data:
-        if line.lower().startswith("*fix"):
-            _match = re.findall(r"(?<=fix\s).+",line[:4].lower()+line[4:])[0]
+        args = command_args(line, "*fix")
+        if args is None:
+            continue
 
-    if _match is not None:
-        print("potential match")
+        fullname = args[0]
+        coordinates = [elem for elem in args[1:] if elem.lower() != "reference"]
+        # survex fixes a station given without coordinates at the origin
+        x, y, z = coordinates[:3] if len(coordinates) >= 3 else ("0", "0", "0")
 
         # separate between station name and survey name. 
-        if "reference" in _match:
-            fullname, _, x, y, z = _match.split()[:5]
-
-        else:
-            fullname, x, y, z = _match.split()[:4]
         if maxlevel != 0:
 
             stn = ".".join(fullname.split(".")[maxlevel:])
@@ -399,10 +439,22 @@ def find_fixes(data, maxlevel):
 def find_inputs(data):
     inputs = []
     for line in data:
-        if line.startswith("*include"):
-            fp = re.findall(r"(?<=include\s).+",line)[0]
-            inputs.append(fp)
+        args = command_args(line, "*include")
+        if args:
+            inputs.append(" ".join(args))
     return inputs
+
+def split_station_address(address, survey_names):
+    """Split a survex station address into its station name and the survey it belongs to. The survey is None if the address contains none of the given survey names"""
+    # survey names use _ instead of dots, so a survey name can span several parts of the address
+    parts = address.split(".")
+    # we prefer the survey nearest to the station, and the longest name ending there
+    for name_end in range(len(parts) - 1, 0, -1):
+        for name_start in range(name_end):
+            name = "_".join(parts[name_start:name_end])
+            if name in survey_names:
+                return ".".join(parts[name_end:]), name
+    return address, None
 
 def find_equates(data, maxlevel, hierarchy):
     equates = []
@@ -410,33 +462,11 @@ def find_equates(data, maxlevel, hierarchy):
     possible_survey_names = list(hierarchy[maxlevel].keys())
 
     for line in data:
-        if line.startswith("*equate"):
-            _match = re.findall(r"(?<=equate\s).+",line)[0]
-        elif line.startswith("*EQUATE"):
-            _match = re.findall(r"(?<=EQUATE\s).+",line)[0]
-        else:
-            _match = None
+        equate = command_args(line, "*equate")
 
-        if _match is not None:
-            # separate between station name and survey name. 
-            equate = _match.split(" ")
-            srv1, srv2 = None, None
-            #by default we define the values to be the entire station address
-            stn1 = equate[0]
-            stn2 = equate[1]
-
-            for name in possible_survey_names:
-                if name in equate[0].replace(".", "_"):
-                    srv1 = name
-                    #in case station have a dot in the name, change dot to _
-                    stn1 = equate[0].replace(".", "_").strip(name).strip("_").replace("_", ".")
-                
-                if name in equate[1].replace(".", "_"):
-                    srv2 = name
-                    stn2 = equate[1].replace(".", "_").strip(name).strip("_").replace("_", ".")
-
-            
-
+        if equate is not None and len(equate) >= 2:
+            stn1, srv1 = split_station_address(equate[0], possible_survey_names)
+            stn2, srv2 = split_station_address(equate[1], possible_survey_names)
             equates.append(((stn1, srv1),(stn2, srv2)))
     return equates
 
@@ -448,12 +478,12 @@ def find_all_file_surveys(data):
         # looking for starts and end lines of survex named surveys. anonymous surveys will be ignored and 
         # put into the same centreline.
         
-        if line.lower().startswith("*begin") and len(line.split()) > 1:
+        begin_args = command_args(line, "*begin")
+        if begin_args:
             starts.append(c)
-            _match = re.findall(r"(?<=begin\s).+",line)[0]
-            survey_names.append(_match.replace(".", "_"))
+            survey_names.append(begin_args[0].replace(".", "_"))
 
-        elif line.startswith("*end") or line.startswith("*END"):
+        elif command_args(line, "*end") is not None:
             ends.append(c)
 
     return starts, ends, survey_names
@@ -470,13 +500,13 @@ def parse_survey_hierarchy(starts, ends, names):
 
     elif len(starts) == 1:
         print("only one survey level in this file")
-        hierarchy[lvl] = {names[0].replace(".", "_").lower(): (starts[0], ends[0])}
+        hierarchy[lvl] = {names[0].replace(".", "_"): (starts[0], ends[0])}
     
     else:
-        while starts[1] < ends[0]:
+        while len(starts) > 1 and starts[1] < ends[0]:
 
             print("at least one level deeper.")
-            hierarchy[lvl] = {names[0].replace(".", "_").lower(): (starts[0], ends[-1])}
+            hierarchy[lvl] = {names[0].replace(".", "_"): (starts[0], ends[-1])}
             starts.pop(0)
             ends.pop(-1)
             names.pop(0)
@@ -485,7 +515,7 @@ def parse_survey_hierarchy(starts, ends, names):
         hierarchy[lvl] = {}
 
         for start, end, name in zip(starts, ends, names):
-            hierarchy[lvl][name.replace(".", "_").lower()] = (start, end)
+            hierarchy[lvl][name.replace(".", "_")] = (start, end)
 
     return hierarchy
 
@@ -500,7 +530,7 @@ def make_survey_data_list(data):
     
     for start, end in starts_ends[max_level].values():
         # if both start and end indices exist we can plunge deeper.
-        if start and end:
+        if start is not None and end is not None:
             survey_data = [elem for elem in data[start+1:end]]
         else:
             survey_data = data
@@ -534,7 +564,17 @@ def find_survey_strategy(data):
         
     return possible_strategies
 
-def parse_survey_data(survey_data, strategy_switches, units_switches, calibration_switches, start, end, expand_lrud):
+def last_unit_before(units_switches, quantities, end, default):
+    """Return the unit set by the last *units switch for one of the given quantities before the end line, or the default if there is none"""
+    units = [next(iter(switch.values())) for line, switch in units_switches if line < end and any(quantity in switch for quantity in quantities)]
+    return units[-1] if units else default
+
+def parse_survey_data(survey_data, strategy_switches, units_switches, calibration_switches, start, end, expand_lrud, renaming):
+
+    # a file without *begin gives no start and end, and its survey data is the whole file
+    first_line = 0 if start is None else start + 1
+    if end is None:
+        end = len(survey_data)
 
     newCentreline = th.Centreline()
     date = find_survey_date(survey_data)[0]
@@ -553,7 +593,7 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
         switch_lines = [elem[0] for elem in normal_strategy_switches]
         # find the last strategy for which the centreline ends. 
         comes_after_index = sum([end > elem for elem in switch_lines]) - 1
-        theStrategy = th.Strategy(input_str= strategy_switches[comes_after_index][1]["normal"], orig_format="survex")
+        theStrategy = th.Strategy(input_str= normal_strategy_switches[comes_after_index][1]["normal"], orig_format="survex")
 
     newCentreline.strategy = theStrategy
 
@@ -572,41 +612,18 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
     
     newCentreline.lrud_reader = LRUD_strategy
 
-    # check the calibration switches
-    if len(calibration_switches) != 0:
-        switch_lines = [elem[0] for elem in calibration_switches]
-        # there may be several calibration switches within a centreline. 
+    # the survex command calibrate declination is of opposite sign to the one understood by therion.
+    declinations = {line: -switch["declination"] for line, switch in calibration_switches if "declination" in switch}
+    # the last declination set before the survey data applies from its first shot
+    earlier_declinations = [declination for line, declination in declinations.items() if line < first_line]
 
-        calibration_indices = [max(elem - start, 0) for elem in switch_lines if end > elem]
-        print(calibration_switches)
-        for c, calibration_index in enumerate(calibration_indices):
-            # the survex command calibrate declination is of opposite sign to the one understood by therion.
-            if "declination" in calibration_switches[c][1].keys():
-                newCentreline.add_declination(-calibration_switches[c][1]["declination"], calibration_index)
-            
     # check the units switches
     if len(units_switches) == 0:
         newCentreline.units = th.Units(" ", fmt = "survex default")
     else:
-        # find the units switch
-        compass_switch_lines = [elem for elem in units_switches if "compass" in elem[1].keys() or "bearing" in elem[1].keys()]
-        # for compass.
-        comes_after_index = sum([end > elem[0] for elem in compass_switch_lines]) - 1
-        compass_unit = list(compass_switch_lines[comes_after_index][1].values())[0]
-        print("should use bearing unit: ", compass_unit)
-
-        clino_switch_lines = [elem for elem in units_switches if "clino" in elem[1].keys() or "gradient" in elem[1].keys()]
-        # for clino.
-        comes_after_index = sum([end > elem[0] for elem in clino_switch_lines]) - 1
-        clino_unit = list(clino_switch_lines[comes_after_index][1].values())[0]
-        print("should use gradient unit: ", clino_unit)
-
-        tape_switch_lines = [elem for elem in units_switches if "tape" in elem[1].keys() or "length" in elem[1].keys()]
-        # for tape.
-        comes_after_index = sum([end > elem[0] for elem in tape_switch_lines]) - 1
-        tape_unit = list(tape_switch_lines[comes_after_index][1].values())[0]
-        print("should use length unit: ", tape_unit)
-
+        compass_unit = last_unit_before(units_switches, ["compass", "bearing"], end, "degrees")
+        clino_unit = last_unit_before(units_switches, ["clino", "gradient"], end, "degrees")
+        tape_unit = last_unit_before(units_switches, ["tape", "length"], end, "meters")
         newCentreline.units = th.Units(" ", length= tape_unit, clino=clino_unit, compass=compass_unit, fmt = "survex")
 
     lrud_datalines = []
@@ -619,15 +636,21 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
 
     if checkLRUDBlock == True:
         for i, line in enumerate(survey_data):
-            if line.lower().startswith("*data passage"):
+            data_args = command_args(line, "*data")
+            if data_args and data_args[0].lower() == "passage":
                 LRUD_start = i
 
+    if earlier_declinations:
+        datalines.append(th.LineDeclination(earlier_declinations[-1]))
+
     for k, line in enumerate(survey_data):
+        if first_line + k in declinations:
+            datalines.append(th.LineDeclination(declinations[first_line + k]))
+
         # check whether commented. 
 
-        if "*flags" in line.lower():
-            theflag = re.findall(r"(?<=flags\s).+",line.lower())[0]
-            datalines.append(th.LineFlag(theflag))
+        if flag_args := command_args(line.lower(), "*flags"):
+            datalines.append(th.LineFlag(" ".join(flag_args)))
         elif line.startswith(";"):
             datalines.append(th.CommentedLine(line.strip(";").strip("\n")))
         elif not (line.strip(" ").strip("\t").startswith(";") or line.strip(" ").strip("\t").startswith("*")):
@@ -638,9 +661,8 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
                     readings, comment = (line.split(";"))
     	            
                     station_from = readings.split()[0]
-                    theComment = th.StationWithComment(station_from.lower(), comment.strip("\n").replace('"',''))
-                    if k > start and k < end:
-                        commented_stations.append(theComment)
+                    theComment = th.StationWithComment(renaming.get(station_from, station_from), comment.strip("\n").replace('"',''))
+                    commented_stations.append(theComment)
                 else: 
                     readings = line
                 
@@ -651,9 +673,8 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
                         from_stn, to_stn, tape, compass, clino = [elem.strip("\n") for elem in split[:5]]
                         if to_stn == "..":
                             to_stn = "."
-                        dataLine = th.NormalDataLine(from_station=from_stn.lower(), to_station= to_stn.lower(), tape=tape, compass= compass, clino=clino)
-                        if k > start and k < end:
-                            datalines.append(dataLine)
+                        dataLine = th.NormalDataLine(from_station=renaming.get(from_stn, from_stn), to_station= renaming.get(to_stn, to_stn), tape=tape, compass= compass, clino=clino)
+                        datalines.append(dataLine)
                     
             else:
                 if len(line.split(";")) ==2:
@@ -662,19 +683,18 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
                     readings = line
                 
                 if len(readings) > 1:
-                    split =  [elem.strip("\n") for elem in readings.replace("\t", " ").split(" ")[:5] if elem]
+                    split = readings.split()[:5]
 
                     if len(split) == 5:
 
                         from_stn, left, right, up, down = split
 
-                        LRUD_dataLine = th.LineLRUD(from_station=from_stn.lower(), 
+                        LRUD_dataLine = th.LineLRUD(from_station=renaming.get(from_stn, from_stn), 
                                                     left = parse_float(left), 
                                                     right= parse_float(right), 
                                                     up= parse_float(up), 
                                                     down = parse_float(down))
-                        if k > start and k < end:
-                            lrud_datalines.append(LRUD_dataLine)
+                        lrud_datalines.append(LRUD_dataLine)
         
     for dataline in datalines:
         newCentreline.add_dataline(dataline)
@@ -688,17 +708,27 @@ def parse_survey_data(survey_data, strategy_switches, units_switches, calibratio
     
     for commented_station in commented_stations:
         newCentreline.add_station_line(commented_station)
-        
+
+    # each centreline is its own Therion survey
+    add_original_names([newCentreline], renaming)
     newCentreline.add_string_repr()
     return newCentreline
 
-def parse_top_level(hierarchy, data, max_lvl, strategies, units_switches, calibration_switches, crs, expand_lrud):
+def switches_in_scope(switches, data, start):
+    """Return the switches that still apply at the start line of a survey. Survex ends a switch at the *end of the block it is set in"""
+    def is_in_scope(switch_line):
+        # the block of the switch has ended if more blocks end than begin between the switch and the survey
+        steps = [1 if command_args(line, "*begin") is not None else -1 if command_args(line, "*end") is not None else 0 for line in data[switch_line + 1:start]]
+        return min(accumulate(steps), default=0) >= 0
+    return [switch for switch in switches if is_in_scope(switch[0])]
+
+def parse_top_level(hierarchy, data, max_lvl, strategies, units_switches, calibration_switches, crs, expand_lrud, renaming):
     toplevelSurveys = []
     
     for elem in hierarchy[0].items():
         toplevelname, start_end = elem
         
-        toplevelSurvey = th.Survey(toplevelname.lower(), isTopLevel=True)
+        toplevelSurvey = th.Survey(toplevelname, isTopLevel=True)
 
         survey_data_list = make_survey_data_list(data)
 
@@ -709,28 +739,38 @@ def parse_top_level(hierarchy, data, max_lvl, strategies, units_switches, calibr
 
 
         for equate in equates:
-            theEquate = th.Equate(equate[0][0].lower(), equate[0][1], equate[1][0].lower(), equate[1][1])
+            theEquate = th.Equate(renaming.get(equate[0][0], equate[0][0]), equate[0][1], renaming.get(equate[1][0], equate[1][0]), equate[1][1])
             print("adding this equate: ", theEquate)
             toplevelSurvey.add_equate(theEquate)
 
         for fix in fixes:
-            theFix = th.Fix(f"{fix[0].lower()}@{fix[1]}", x=float(fix[2]), y=float(fix[3]), z=float(fix[4]), crs=crs)
+            station = renaming.get(fix[0], fix[0]) if fix[1] is None else f"{renaming.get(fix[0], fix[0])}@{fix[1]}"
+            theFix = th.Fix(station, x=float(fix[2]), y=float(fix[3]), z=float(fix[4]), crs=crs)
             toplevelSurvey.add_entrance_fix(theFix)
 
         names = [elem for elem in hierarchy[max_lvl].keys()]
 
         if max_lvl == 0:
             start, end = hierarchy[max_lvl][toplevelSurvey.name]
-            centreline = parse_survey_data(survey_data_list[0], strategies, units_switches, calibration_switches, start, end, expand_lrud)
+            scope_start = 0 if start is None else start
+            centreline = parse_survey_data(survey_data_list[0], 
+                                           switches_in_scope(strategies, data, scope_start), 
+                                           switches_in_scope(units_switches, data, scope_start), 
+                                           switches_in_scope(calibration_switches, data, scope_start), 
+                                           start, end, expand_lrud, renaming)
             
             toplevelSurvey.add_centrelines([centreline])
 
         else:
             for name, survey_data in zip(names, survey_data_list):
                 start, end = hierarchy[max_lvl][name]
-                centreline = parse_survey_data(survey_data,  strategies, units_switches, calibration_switches, start, end, expand_lrud)
+                centreline = parse_survey_data(survey_data, 
+                                               switches_in_scope(strategies, data, start), 
+                                               switches_in_scope(units_switches, data, start), 
+                                               switches_in_scope(calibration_switches, data, start), 
+                                               start, end, expand_lrud, renaming)
 
-                ChildSurvey = th.Survey(name.lower())
+                ChildSurvey = th.Survey(name)
                 ChildSurvey.add_centrelines([centreline])
                 ChildSurvey.add_string_repr()
             
@@ -759,20 +799,16 @@ def find_calibration_switches(data):
     calibration_switches = []
 
     for c, line in enumerate(data):
-        isCalibrationSwitch = line.strip(" ").lower().startswith("*calibrate")
-
-        if isCalibrationSwitch:
-            switch_line = [elem for elem in line.lower().strip("\n").strip(" ").strip("*units").split(" ") if elem]
-            if len(switch_line) == 3:
-                calibration_switches.append((c,{switch_line[1]: float(switch_line[2])}))
+        switch_line = command_args(line.lower(), "*calibrate")
+        if switch_line is not None and len(switch_line) == 2:
+            calibration_switches.append((c,{switch_line[0]: float(switch_line[1])}))
     return calibration_switches
 
 def find_units_switches(data):
     units_switches = []
     for c, line in enumerate(data):
-        isUnitSwitch = line.strip().lower().startswith("*units")     
-        if isUnitSwitch:
-            switch_line = [elem for elem in line.lower().strip().strip("*units").split() if elem]
+        switch_line = command_args(line.lower(), "*units")
+        if switch_line is not None:
             if len(switch_line) == 2:
                 units_switches.append((c,{switch_line[0]: switch_line[1]}))
             elif len(switch_line)==3:
@@ -783,16 +819,29 @@ def find_units_switches(data):
 
 
 def convert_single_datafile(input: str, output: str, crs: str = "epsg:3857", expand_lrud: bool= False) -> None:
-    # input et output: chemins
-
-    print("Will there be injected LRUD?", expand_lrud)
-    print("parsing a single file.")
+    """Convert a survex data file to a therion file of the same name in the output directory"""
     input_dir = dirname(input)
 
     input_file = input[len(input_dir)+1:]
     basename = input_file[:-4]
 
-    output_filename = join(output, f"{basename}.th")
+    renaming = station_renaming(survey_station_names(parse_datafile(input, crs, expand_lrud, {})))
+    convert_datafile(input, join(output, f"{basename}.th"), crs, expand_lrud, renaming)
+
+def convert_datafile(input: str, output_filename: str, crs: str, expand_lrud: bool, renaming: dict[str, str]) -> None:
+    TOP_LEVEL_STR = """
+"""
+    for top_level_survey in parse_datafile(input, crs, expand_lrud, renaming):
+        TOP_LEVEL_STR += top_level_survey._string_repr
+
+
+    with open(output_filename, "w", encoding="utf-8") as f:
+        f.writelines(TOP_LEVEL_STR)
+        f.close()
+
+def parse_datafile(input: str, crs: str, expand_lrud: bool, renaming: dict[str, str]) -> list:
+    print("Will there be injected LRUD?", expand_lrud)
+    print("parsing a single file.")
     DATA = read_raw_data(input)
     
     # need to double check that the single svx file is indeed a data file.
@@ -808,26 +857,17 @@ def convert_single_datafile(input: str, output: str, crs: str = "epsg:3857", exp
     # INPUTS = find_inputs(DATA)
     # SURVEY_DATA_LIST = make_survey_data_list(DATA)
     # TOP_LEVEL_NAME = list(HIERARCHY[0].keys())[0]
-    TOP_LEVEL_SURVEYS = parse_top_level(HIERARCHY, 
-                                        DATA, 
-                                        MAX_LVL, 
-                                        STRATEGIES, 
-                                        UNITS_SWITCHES, 
-                                        CALIBRATION_SWITCHES, 
-                                        CRS, 
-                                        EXPAND_LRUD)
+    return parse_top_level(HIERARCHY, 
+                           DATA, 
+                           MAX_LVL, 
+                           STRATEGIES, 
+                           UNITS_SWITCHES, 
+                           CALIBRATION_SWITCHES, 
+                           crs, 
+                           expand_lrud,
+                           renaming)
 
-    TOP_LEVEL_STR = """
-"""
-    for top_level_survey in TOP_LEVEL_SURVEYS:
-        TOP_LEVEL_STR += top_level_survey._string_repr
-
-
-    with open(output_filename, "w", encoding="utf-8") as f:
-        f.writelines(TOP_LEVEL_STR)
-        f.close()
-
-def convert_files_in_directory(addresses_dict, input_dir, output_dir):
+def convert_files_in_directory(addresses_dict, input_dir, output_dir, crs, expand_lrud):
 
     list_all_paths = [elem.strip() for elem in addresses_dict.keys()]
     list_all_addresses = []
@@ -839,13 +879,21 @@ def convert_files_in_directory(addresses_dict, input_dir, output_dir):
             for item in elem:
                 list_all_addresses.append(item.strip())
 
+    # the equates and fixes of one file refer to stations of other files, so the whole project shares one renaming
+    names = []
+    for filepath in list_all_paths:
+        with open(filepath, "r", encoding='utf-8') as f:
+            is_index_file = "*include" in f.read().lower()
+        names += index_station_names(filepath, list_all_addresses) if is_index_file else survey_station_names(parse_datafile(filepath, crs, expand_lrud, {}))
+    renaming = station_renaming(names)
+
     for filepath in list_all_paths: #index_file_paths:
 
         #load and reformat equates
         ############################
-        new_filepath = normpath(filepath).replace(normpath(input_dir),normpath(output_dir)).replace('.svx','.th')
-        directory = dirname(filepath)
-        new_directory = dirname(new_filepath.lower())
+        # output paths are lowercase, to match the lowercase file names in the input commands
+        new_filepath = join(output_dir, relpath(filepath, input_dir).lower().removesuffix(".svx") + ".th")
+        new_directory = dirname(new_filepath)
         if not exists(abspath(new_directory)):
             print("the output directory does not exist yet.")
             makedirs(new_directory)
@@ -856,8 +904,8 @@ def convert_files_in_directory(addresses_dict, input_dir, output_dir):
             content = f.read()
             f.close()
 
-            if "*include" in content: 
-                equates = reformat_equates(filepath,list_all_addresses)
+            if "*include" in content.lower(): 
+                equates = reformat_equates(filepath,list_all_addresses,renaming)
 
                 #load and reformat includes
                 ###########################
@@ -865,11 +913,11 @@ def convert_files_in_directory(addresses_dict, input_dir, output_dir):
 
                 #load and reformat fixes
                 ###########################
-                fixs = reformat_fixes(filepath,list_all_addresses)
+                fixs = reformat_fixes(filepath,list_all_addresses,renaming)
 
                 #load and reformat entrances
                 ############################
-                entrances = reformat_entrances(filepath,list_all_addresses)
+                entrances = reformat_entrances(filepath,list_all_addresses,renaming)
 
                 #load and reformat comments
                 ############################
@@ -902,7 +950,7 @@ def convert_files_in_directory(addresses_dict, input_dir, output_dir):
 
             else: # if this is a single data file, use other converter before writing to file. 
                 print("this appears to be a single datafile. Ignoring for now.")
-                convert_single_datafile(filepath.lower(), new_directory.lower())
+                convert_datafile(filepath, new_filepath, crs, expand_lrud, renaming)
 
 ##### SCRIPT CALLING. ######
 
@@ -966,7 +1014,7 @@ if __name__ == "__main__":
         else:   
             ALL_ADDRESSES = traverse_survey_structure(directory=INPUT, rootfile=ROOTFILE)
 
-            convert_files_in_directory(ALL_ADDRESSES, INPUT, OUTPUT)
+            convert_files_in_directory(ALL_ADDRESSES, INPUT, OUTPUT, CRS, EXPAND_LRUD)
         # generate list of paths to convert.
         # for each file:
         #        test isdatafile or not,
