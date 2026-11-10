@@ -12,24 +12,32 @@ usage: tr2th.py [-h] survey_file survey_selector
 Convert a Toporobot file to Therion format
 
 positional arguments:
-  survey_file      The toporobot archive file (*.TEXT) to work from."
-  survey_selector  The basename of the survey for the therion file (may not include special characters)"
-
+  survey_file      The toporobot archive file (*.TXT) to work from.
+  survey_selector  The basename of the survey for the therion file (may not include special characters)
+  
 options:
-  -h, --help       show this help message and exit
+  -o, --output      the file in which to store the output
+  -crsin, --input_coordinate_reference_system
+                    an epsg code in the form "epsg:12345", defaults to None
+  -crsout, --output_coordinate_reference_system
+                    an epsg code in the form "epsg:12345", defaults to None
+  -e, --encoding    the encoding of the file to be read, defaults to utf-8
+  -ikc, --inst_key_col
+                    where to find the instrument key, defaults to 2
+  -h, --help        show this help message and exit
 
 ```
 
 You can test it by running the following script to generate some sample data
 
 ```
-python tr2th.py sample_data\orutura_cave.trb Orutura -o ../converted
+python tr2th.py sample_data/Vallorbe.Text Vallorbe -o ../converted
 ```
 
 You can then navigate to the level of the output directory and run:
 
 ```
-therion Orutura.thconfig
+therion Vallorbe.thconfig
 ```
 
 
